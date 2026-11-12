@@ -1,0 +1,136 @@
+﻿diff --git "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\exporter.py" "b/core\\exporter.py"
+index 21d66da..d62840f 100644
+--- "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\exporter.py"
++++ "b/core\\exporter.py"
+@@ -13,6 +13,10 @@ The monthly columns are generated from the order date.  For an order on
+ and November.  Historical cells remain blank -- never zero -- when the item
+ was not present in the uploaded historical-sales source.
+ 
++The final sheet's ``╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣`` is the net branch position: raw branch
++stock plus pending purchases.  Their source values remain separate on the
++optional ``Audit`` worksheet.
++
+ Row colours are applied cell by cell so they survive Excel filters:
+ 
+ * pink / ``#FFC0CB`` -- warehouse loading (highest priority)
+@@ -245,7 +249,7 @@ def _frame_from_diagnostics(
+     code = _first_present(source, ("╪º┘ä┘â┘ê╪»", "┘â┘ê╪» ╪º┘ä╪╡┘å┘ü", "┘â┘ê╪»"))
+     name = _first_present(source, ("╪º┘ä╪º╪│┘à", "╪º╪│┘à ╪º┘ä╪╡┘å┘ü", "Master_Name"))
+     required = _first_present(
+-        source, ("╪º┘ä┘à╪╖┘ä┘ê╪¿", "Final_Purchase_Order", "Calculated_Order")
++        source, ("Calculated_Order", "╪º┘ä┘à╪╖┘ä┘ê╪¿", "Final_Purchase_Order")
+     )
+     price = _first_present(source, ("╪º┘ä╪│╪╣╪▒", "╪│╪╣╪▒ ╪º┘ä╪¿┘è╪╣", "Price", "Unit_Cost"))
+     branch = _first_present(source, ("╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣", "Branch_Stock", "╪º┘ä┘à┘ê╪¼┘ê╪»"))
+@@ -359,7 +363,10 @@ def _coerce_export_frame(
+     )
+ 
+ 
+-def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
++def _normalise_numbers(
++    frame: pd.DataFrame,
++    preserve_codes: set[str] | None = None,
++) -> pd.DataFrame:
+     """Coerce numeric columns, compute money, and drop non-positive lines."""
+     frame = frame.copy()
+     sales_columns = [column for column in frame.columns if _is_sales_column(str(column))]
+@@ -391,10 +398,21 @@ def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
+         * pd.to_numeric(frame["╪º┘ä╪│╪╣╪▒"], errors="coerce").fillna(0.0)
+     )
+ 
+-    # Future rows are filtered only after the money formula is calculated.
+-    frame = frame.loc[frame["╪º┘ä┘à╪╖┘ä┘ê╪¿"] > 0].copy()
++    # Keep every positive branch need **and** every negative branch balance.
++    # A negative balance is an inventory exception; dropping it hides the exact
++    # item (for example the user's TRESIBA case) that the buyer must investigate.
++    branch_balance = pd.to_numeric(
++        frame["╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣"], errors="coerce"
++    ).fillna(0.0)
++    keep = (frame["╪º┘ä┘à╪╖┘ä┘ê╪¿"] > 0) | (branch_balance < 0)
++    if preserve_codes:
++        keep |= _normalise_code_series(frame["╪º┘ä┘â┘ê╪»"]).isin(preserve_codes)
++    frame = frame.loc[keep].copy()
+     if frame.empty:
+-        raise ValueError("There are no items with a positive required quantity.")
++        raise ValueError(
++            "There are no items with a positive required quantity or a negative "
++            "branch balance."
++        )
+ 
+     # System figures: a missing value means "not available", but the column
+     # is still numeric, so zero is the honest empty value.
+@@ -769,7 +787,7 @@ def _write_audit_sheet(
+ 
+     source = diagnostics.copy()
+     source["_Code"] = _normalise_code_series(source["╪º┘ä┘â┘ê╪»"])
+-    source = source.drop_duplicates("_Code", keep="first").set_index("_Code")
++    source = source.loc[source["_Code"].notna()]
+     export_codes = _normalise_code_series(data["╪º┘ä┘â┘ê╪»"])
+     audit = pd.DataFrame(index=data.index)
+     audit["╪º┘ä┘â┘ê╪»"] = data["╪º┘ä┘â┘ê╪»"].to_numpy()
+@@ -780,8 +798,10 @@ def _write_audit_sheet(
+         ("╪¬╪¡┘ê┘è┘ä╪º╪¬ ╪╡╪º╪»╪▒╪⌐", "Transfers_Out"),
+     ):
+         if origin in source.columns:
++            values = pd.to_numeric(source[origin], errors="coerce").fillna(0.0)
++            totals = source.assign(_Value=values).groupby("_Code")["_Value"].sum()
+             audit[target] = (
+-                export_codes.map(pd.to_numeric(source[origin], errors="coerce"))
++                export_codes.map(totals)
+                 .fillna(0.0)
+                 .to_numpy()
+             )
+@@ -790,6 +810,31 @@ def _write_audit_sheet(
+     audit.to_excel(writer, sheet_name="Audit", index=False)
+ 
+ 
++def _branch_balance_adjustments(
++    diagnostics: pd.DataFrame | None,
++) -> tuple[pd.Series | None, set[str]]:
++    """Return net branch balances and raw-negative item codes from diagnostics."""
++    required = {"╪º┘ä┘â┘ê╪»", "Branch_Stock", "Pending_Purchases"}
++    if diagnostics is None or diagnostics.empty or not required.issubset(
++        diagnostics.columns
++    ):
++        return None, set()
++
++    source = diagnostics.loc[:, ["╪º┘ä┘â┘ê╪»", "Branch_Stock", "Pending_Purchases"]].copy()
++    source["_Code"] = _normalise_code_series(source["╪º┘ä┘â┘ê╪»"])
++    source = source.loc[source["_Code"].notna()].copy()
++    source["Branch_Stock"] = pd.to_numeric(
++        source["Branch_Stock"], errors="coerce"
++    ).fillna(0.0)
++    source["Pending_Purchases"] = pd.to_numeric(
++        source["Pending_Purchases"], errors="coerce"
++    ).fillna(0.0)
++    totals = source.groupby("_Code")[["Branch_Stock", "Pending_Purchases"]].sum()
++    net_balance = totals["Branch_Stock"] + totals["Pending_Purchases"]
++    negative_codes = set(totals.index[totals["Branch_Stock"] < 0].astype(str))
++    return net_balance, negative_codes
++
++
+ def export_styled_excel(
+     data: pd.DataFrame,
+     *,
+@@ -822,7 +867,20 @@ def export_styled_excel(
+         progress_callback("≡ƒº╛ Preparing the final 20-column order sheet...")
+ 
+     export_data = _coerce_export_frame(data, diagnostics)
+-    export_data = _normalise_numbers(export_data)
++    net_branch_balance, negative_branch_codes = _branch_balance_adjustments(
++        diagnostics
++    )
++    export_data = _normalise_numbers(
++        export_data,
++        preserve_codes=negative_branch_codes,
++    )
++    if net_branch_balance is not None:
++        net_values = _normalise_code_series(export_data["╪º┘ä┘â┘ê╪»"]).map(
++            net_branch_balance
++        )
++        export_data["╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣"] = net_values.where(
++            net_values.notna(), export_data["╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣"]
++        )
+     colours = _row_colours(
+         export_data,
+         diagnostics,

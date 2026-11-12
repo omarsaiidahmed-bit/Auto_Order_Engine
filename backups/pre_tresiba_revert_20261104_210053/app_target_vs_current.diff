@@ -1,0 +1,268 @@
+﻿diff --git "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\app.py" b/app.py
+index e67591e..0010504 100644
+--- "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\app.py"
++++ b/app.py
+@@ -38,7 +38,7 @@ from core.schedules import (
+     compute_schedule_cycle,
+     schedule_for,
+ )
+-from core.supply_chain import PipelineResult, compute_lead_time, run_pipeline
++from core.supply_chain import run_pipeline
+ 
+ APP_DIR = Path(__file__).resolve().parent
+ LOGO_PATH = APP_DIR / "company_logo.png"
+@@ -132,7 +132,7 @@ TEXT: dict[str, dict[str, str]] = {
+         "run_notes": "┘à┘ä╪º╪¡╪╕╪º╪¬ ╪º┘ä╪¬╪┤╪║┘è┘ä",
+         "preview_title": "┘à╪╣╪º┘è┘å╪⌐ ╪º┘ä╪╖┘ä╪¿┘è╪⌐ ╪º┘ä┘å┘ç╪º╪ª┘è╪⌐",
+         "preview_eyebrow": "┘à╪▒╪º╪¼╪╣╪⌐",
+-        "preview_columns": "╪ú╪╣┘à╪»╪⌐ ┘à╪«╪¬╪º╪▒╪⌐ ┘à┘å ╪ú╪╡┘ä 20 ╪╣┘à┘ê╪»╪º┘ï ┘ü┘è ┘à┘ä┘ü Excel ╪º┘ä┘å┘ç╪º╪ª┘è.",
++        "preview_columns": "10 ╪ú╪╣┘à╪»╪⌐ ╪ú╪│╪º╪│┘è╪⌐ ┘à┘å ╪ú╪╡┘ä 13 ┘ü┘è ┘à┘ä┘ü Excel.",
+         "legend_push": "┘é╪º╪ª┘à╪⌐ ╪º┘ä╪»┘ü╪╣",
+         "legend_multi": "╪ú┘â╪½╪▒ ┘à┘å ┘â╪º╪▒╪¬┘ç",
+         "legend_transfer": "╪¬╪¡┘ê┘è┘ä╪º╪¬",
+@@ -177,8 +177,8 @@ TEXT: dict[str, dict[str, str]] = {
+         "planning_policy": "╪│┘è╪º╪│╪⌐ ╪º┘ä╪¬╪«╪╖┘è╪╖",
+         "z_label": "┘à╪╣╪º┘à┘ä ╪º┘ä╪ú┘à╪º┘å Z",
+         "z_help": "┘â┘ä┘à╪º ╪▓╪º╪»╪¬ Z ╪▓╪º╪» ┘à╪«╪▓┘ê┘å ╪º┘ä╪ú┘à╪º┘å.",
+-        "review_label": "┘ü╪¬╪▒╪⌐ ╪º┘ä╪¬╪║╪╖┘è╪⌐ (Coverage Days)",
+-        "review_help": "╪╣╪»╪» ╪ú┘è╪º┘à ╪º┘ä╪¬╪║╪╖┘è╪⌐ ╪º┘ä┘à╪│╪¬╪«╪»┘à╪⌐ ┘ü┘è ┘à╪╣╪º╪»┘ä╪⌐ ╪º┘ä┘ç╪»┘ü.",
++        "review_label": "┘ü╪¬╪▒╪⌐ ╪º┘ä┘à╪▒╪º╪¼╪╣╪⌐ (╪ú┘è╪º┘à)",
++        "review_help": "╪╣╪»╪» ╪ú┘è╪º┘à ╪º┘ä╪¬╪║╪╖┘è╪⌐ ╪¿┘è┘å ┘à╪▒╪º╪¼╪╣╪¬┘è┘å.",
+         "variance_label": "┘å╪│╪¿╪⌐ ╪º┘ä╪¬╪¿╪º┘è┘å",
+         "variance_help": "┘å╪│╪¿╪⌐ ╪º┘ä╪¬╪¿╪º┘è┘å ╪º┘ä┘à╪│╪¬╪«╪»┘à╪⌐ ╪╣┘å╪» ╪║┘è╪º╪¿ ╪º┘å╪¡╪▒╪º┘ü ┘à┘ê╪½┘ê┘é.",
+         "stock_basis": "╪ú╪│╪º╪│ ╪º┘ä╪▒╪╡┘è╪»",
+@@ -187,20 +187,16 @@ TEXT: dict[str, dict[str, str]] = {
+         "pack_rounding": "╪¬┘é╪▒┘è╪¿ ┘ä╪╣╪»╪» ╪╣╪¿┘ê╪º╪¬ ┘â╪º┘à┘ä",
+         "substitutes_enabled": "╪¬┘ü╪╣┘è┘ä ╪º┘ä╪¿╪»╪º╪ª┘ä",
+         "allocate_warehouse": "╪«╪╡┘à ╪▒╪╡┘è╪» ╪º┘ä┘à╪«╪▓┘å ╪º┘ä┘à╪▒┘â╪▓┘è",
+-        "include_transfers": "╪¬╪╢┘à┘è┘å ╪º┘ä╪¬╪¡┘ê┘è┘ä╪º╪¬ (Include Transfers)",
+-        "ignore_no_sales": "╪¬╪¼╪º┘ç┘ä ╪º┘ä╪ú╪╡┘å╪º┘ü ╪º┘ä┘ä┘è ┘à┘ä┘ç╪º╪┤ ┘à╪╣╪»┘ä ╪¿┘è╪╣ (Ignore items with no sales rate)",
+         "save_settings": "╪¡┘ü╪╕ ╪º┘ä╪Ñ╪╣╪»╪º╪»╪º╪¬",
+         "saved_settings": "╪¬┘à ╪¡┘ü╪╕ ╪º┘ä╪Ñ╪╣╪»╪º╪»╪º╪¬╪î ┘ê╪│╪¬┘Å╪│╪¬╪«╪»┘à ┘ü┘è ╪º┘ä╪¬┘ê┘ä┘è╪» ╪º┘ä┘é╪º╪»┘à.",
+         "active_settings": "╪º┘ä╪Ñ╪╣╪»╪º╪»╪º╪¬ ╪º┘ä┘å╪┤╪╖╪⌐",
+         "active_z": "Z",
+-        "active_review": "╪º┘ä╪¬╪║╪╖┘è╪⌐",
++        "active_review": "╪º┘ä┘à╪▒╪º╪¼╪╣╪⌐",
+         "active_variance": "╪º┘ä╪¬╪¿╪º┘è┘å",
+         "active_basis": "╪º┘ä╪ú╪│╪º╪│",
+         "active_demand": "╪º┘ä┘à╪╡╪»╪▒",
+         "active_method": "╪º┘ä╪╖╪▒┘è┘é╪⌐",
+         "active_substitutes": "╪º┘ä╪¿╪»╪º╪ª┘ä",
+-        "active_transfers": "╪º┘ä╪¬╪¡┘ê┘è┘ä╪º╪¬",
+-        "active_ignore_no_sales": "╪¬╪¼╪º┘ç┘ä ╪¿┘ä╪º ┘à╪╣╪»┘ä",
+         "active_warehouse": "╪º┘ä┘à╪«╪▓┘å ╪º┘ä┘à╪▒┘â╪▓┘è",
+         "enabled": "┘à┘ü╪╣┘ä╪⌐",
+         "disabled": "┘à╪╣╪╖┘ä╪⌐",
+@@ -308,7 +304,7 @@ TEXT: dict[str, dict[str, str]] = {
+         "run_notes": "Run notes",
+         "preview_title": "Final order preview",
+         "preview_eyebrow": "Review",
+-        "preview_columns": "Selected key columns; the Excel file carries the full twenty-column contract.",
++        "preview_columns": "The ten key columns; the Excel file carries all thirteen.",
+         "legend_push": "Pushing list",
+         "legend_multi": "Multiple cards",
+         "legend_transfer": "Transfers",
+@@ -353,8 +349,8 @@ TEXT: dict[str, dict[str, str]] = {
+         "planning_policy": "Planning policy",
+         "z_label": "Safety factor Z",
+         "z_help": "Higher Z means more safety stock.",
+-        "review_label": "Coverage days",
+-        "review_help": "Days of coverage used by the target-level formula.",
++        "review_label": "Review period (days)",
++        "review_help": "Days of coverage between reviews.",
+         "variance_label": "Variance percent",
+         "variance_help": "Fallback dispersion when no reliable sigma is available.",
+         "stock_basis": "Stock basis",
+@@ -363,20 +359,16 @@ TEXT: dict[str, dict[str, str]] = {
+         "pack_rounding": "Round to whole packs",
+         "substitutes_enabled": "Enable substitutes",
+         "allocate_warehouse": "Deduct central warehouse stock",
+-        "include_transfers": "Include Transfers",
+-        "ignore_no_sales": "Ignore items with no sales rate",
+         "save_settings": "Save settings",
+         "saved_settings": "Settings saved; they will be used on the next run.",
+         "active_settings": "Active settings",
+         "active_z": "Z",
+-        "active_review": "Coverage",
++        "active_review": "Review",
+         "active_variance": "Variance",
+         "active_basis": "Basis",
+         "active_demand": "Source",
+         "active_method": "Method",
+         "active_substitutes": "Substitutes",
+-        "active_transfers": "Transfers",
+-        "active_ignore_no_sales": "Ignore no-sales",
+         "active_warehouse": "Warehouse",
+         "enabled": "enabled",
+         "disabled": "disabled",
+@@ -1791,28 +1783,10 @@ def render_order_page() -> None:
+                 "order_date": order_date,
+                 "total": len(final_df),
+             }
+-            diagnostics = result.diagnostics
+-            warehouse_codes: set[str] = set()
+-            transfer_codes: set[str] = set()
+-            if diagnostics is not None and not diagnostics.empty and "╪º┘ä┘â┘ê╪»" in diagnostics.columns:
+-                diagnostics_codes = diagnostics["╪º┘ä┘â┘ê╪»"].map(_normalise_code)
+-                if "Warehouse_Loading" in diagnostics.columns:
+-                    warehouse_codes = set(
+-                        diagnostics_codes[
+-                            diagnostics["Warehouse_Loading"].fillna(False).astype(bool)
+-                        ]
+-                    )
+-                if "Is_Transfer" in diagnostics.columns:
+-                    transfer_codes = set(
+-                        diagnostics_codes[
+-                            diagnostics["Is_Transfer"].fillna(False).astype(bool)
+-                        ]
+-                    )
+             st.session_state.result_highlights = {
+                 "pushing": _uploaded_codes(data_by_role.get("pushing_list"), ("╪º┘ä┘â┘ê╪»", "┘â┘ê╪» ╪º┘ä╪╡┘å┘ü")),
+                 "multi": _uploaded_codes(data_by_role.get("multi_price"), ("┘â┘ê╪» ╪º┘ä╪╡┘å┘ü", "╪º┘ä┘â┘ê╪»")),
+-                "transfer": transfer_codes or _uploaded_codes(data_by_role.get("transfers"), ("┘â┘ê╪» ╪º┘ä╪╡┘å┘ü", "╪º┘ä┘â┘ê╪»")),
+-                "warehouse": warehouse_codes,
++                "transfer": _uploaded_codes(data_by_role.get("transfers"), ("┘â┘ê╪» ╪º┘ä╪╡┘å┘ü", "╪º┘ä┘â┘ê╪»")),
+             }
+             progress.progress(1.0, text=tr("generated"))
+         except MissingInputs:
+@@ -1851,25 +1825,16 @@ def render_order_page() -> None:
+ 
+     section_head(tr("preview_eyebrow"), tr("preview_title"), tr("preview_columns"))
+ 
+-    sales_columns = [
+-        column for column in final_df.columns if str(column).startswith("┘à╪¿┘è╪╣╪º╪¬ ")
+-    ]
+     display_columns = [
+         ("╪º┘ä┘â┘ê╪»", "Code" if lang() == "en" else "╪º┘ä┘â┘ê╪»"),
+         ("╪º┘ä╪¬╪╡┘å┘è┘ü", "Category" if lang() == "en" else "╪º┘ä╪¬╪╡┘å┘è┘ü"),
+         ("╪º┘ä╪º╪│┘à", "Name" if lang() == "en" else "╪º┘ä╪º╪│┘à"),
+         ("╪º┘ä┘à╪╖┘ä┘ê╪¿", "Required" if lang() == "en" else "╪º┘ä┘à╪╖┘ä┘ê╪¿"),
+-        ("╪º┘ä┘é┘è┘à╪⌐ ╪º┘ä┘à╪º┘ä┘è╪⌐ ┘ä┘ä╪╖┘ä╪¿", "Order value" if lang() == "en" else "╪º┘ä┘é┘è┘à╪⌐ ╪º┘ä┘à╪º┘ä┘è╪⌐ ┘ä┘ä╪╖┘ä╪¿"),
+-        ("╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣", "Branch" if lang() == "en" else "╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣"),
+-        ("╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘à╪«╪▓┘å", "Warehouse" if lang() == "en" else "╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘à╪«╪▓┘å"),
+-        ("╪º┘ä╪¬╪¡┘ê┘è┘ä╪º╪¬", "Transfers" if lang() == "en" else "╪º┘ä╪¬╪¡┘ê┘è┘ä╪º╪¬"),
+-        *[(column, column) for column in sales_columns],
++        ("╪º┘ä┘à┘ê╪¼┘ê╪»", "Existing" if lang() == "en" else "╪º┘ä┘à┘ê╪¼┘ê╪»"),
+         ("╪º┘ä┘à╪¬┘ê╪│╪╖", "Average" if lang() == "en" else "╪º┘ä┘à╪¬┘ê╪│╪╖"),
+         ("ROP", "ROP"),
+-        ("Lead_Time", "Lead time" if lang() == "en" else "Lead_Time"),
+-        ("╪¬╪º╪▒┘è╪« ╪º┘ä┘ê╪╡┘ê┘ä ╪º┘ä┘à╪¬┘ê┘é╪╣", "Expected arrival" if lang() == "en" else "╪¬╪º╪▒┘è╪« ╪º┘ä┘ê╪╡┘ê┘ä ╪º┘ä┘à╪¬┘ê┘é╪╣"),
+-        ("╪¬╪║╪╖┘è╪⌐ ╪º┘ä┘à╪«╪▓┘ê┘å (╪ú┘è╪º┘à)", "Stock cover (days)" if lang() == "en" else "╪¬╪║╪╖┘è╪⌐ ╪º┘ä┘à╪«╪▓┘ê┘å (╪ú┘è╪º┘à)"),
+-        ("╪│╪¿╪¿ ╪º┘ä╪╖┘ä╪¿", "Order reason" if lang() == "en" else "╪│╪¿╪¿ ╪º┘ä╪╖┘ä╪¿"),
++        ("Demand", "Demand"),
++        ("╪º┘ä╪¿╪»┘è┘ä", "Substitute" if lang() == "en" else "╪º┘ä╪¿╪»┘è┘ä"),
+         ("┘à┘ä╪º╪¡╪╕╪º╪¬", "Notes" if lang() == "en" else "┘à┘ä╪º╪¡╪╕╪º╪¬"),
+     ]
+     available = [(source, target) for source, target in display_columns if source in final_df.columns]
+@@ -1890,18 +1855,18 @@ def render_order_page() -> None:
+     pushing_codes = highlights.get("pushing", set())
+     multi_codes = highlights.get("multi", set())
+     transfer_codes = highlights.get("transfer", set())
+-    warehouse_codes = highlights.get("warehouse", set())
+ 
+     def row_style(row: pd.Series) -> list[str]:
+         code = _normalise_code(row.get(code_column, ""))
+-        if code in warehouse_codes:
+-            color = "#FFC0CB"
+-        elif code in pushing_codes:
++        notes = str(row.get(notes_column, ""))
++        if code in pushing_codes:
+             color = "#ADD8E6"
+-        elif code in transfer_codes:
+-            color = "#FFFFE0"
+         elif code in multi_codes:
+             color = "#D3D3D3"
++        elif code in transfer_codes:
++            color = "#FFFFE0"
++        elif "╪º┘ä┘à╪«╪▓┘å" in notes:
++            color = "#FFC0CB"
+         else:
+             color = ""
+         return [f"background-color: {color}" if color else "" for _ in row]
+@@ -2114,7 +2079,6 @@ def render_settings_page() -> None:
+                     help=tr("review_help"),
+                     key="cfg_review",
+                 )
+-                coverage_days = int(review_period)
+                 variance = st.slider(
+                     tr("variance_label"),
+                     0,
+@@ -2164,38 +2128,13 @@ def render_settings_page() -> None:
+                 value=bool(current.allocate_warehouse_stock),
+                 key="cfg_warehouse",
+             )
+-            toggle_4, toggle_5 = st.columns(2)
+-            include_transfers = toggle_4.checkbox(
+-                tr("include_transfers"),
+-                value=bool(current.include_transfers),
+-                key="cfg_include_transfers",
+-            )
+-            ignore_no_sales = toggle_5.checkbox(
+-                tr("ignore_no_sales"),
+-                value=bool(current.ignore_no_sales_rate),
+-                key="cfg_ignore_no_sales",
+-            )
+-            st.subheader("ΓÜá∩╕Å Advanced Overrides")
+-            toggle_6, toggle_7 = st.columns(2)
+-            enable_cosmetics_force = toggle_6.checkbox(
+-                "Force Push ┘ä┘ä╪¬╪¼┘à┘è┘ä",
+-                value=bool(current.enable_cosmetics_force),
+-                help="┘ä┘ê ┘à┘ü╪╣┘æ┘ä╪î ╪º┘ä╪¬╪¼┘à┘è┘ä ┘è╪¬┘ê╪▓╪╣ ╪¡╪¬┘ë ┘ä┘ê ┘à╪¿┘è╪╣╪º╪¬┘ç 0",
+-                key="cfg_enable_cosmetics_force",
+-            )
+-            enable_pushing_override = toggle_7.checkbox(
+-                "Pushing List Override",
+-                value=bool(current.enable_pushing_override),
+-                help="┘ä┘ê ┘à┘ü╪╣┘æ┘ä╪î Pushing List ┘è╪¬╪¡┘â┘à ┘ü┘è ╪º┘ä┘à╪╖┘ä┘ê╪¿",
+-                key="cfg_enable_pushing_override",
+-            )
+             submitted = st.form_submit_button(tr("save_settings"), type="primary", use_container_width=True)
+ 
+     if submitted:
+         st.session_state.settings = replace(
+             current,
+             z_score=float(z_score),
+-            review_period_days=int(coverage_days),
++            review_period_days=int(review_period),
+             variance_percent=float(variance),
+             stock_basis=stock_basis,
+             demand_source=demand_source,
+@@ -2203,22 +2142,14 @@ def render_settings_page() -> None:
+             pack_rounding=bool(pack_rounding),
+             substitutes_enabled=bool(substitutes_enabled),
+             allocate_warehouse_stock=bool(allocate_warehouse),
+-            include_transfers=bool(include_transfers),
+-            ignore_no_sales_rate=bool(ignore_no_sales),
+-            enable_cosmetics_force=bool(enable_cosmetics_force),
+-            enable_pushing_override=bool(enable_pushing_override),
+         )
+-        # The generated workbook must never survive a settings change.
+-        st.session_state.result_bytes = None
+-        st.session_state.result_final = None
+-        st.session_state.result_diagnostics = None
+         st.success(tr("saved_settings"))
+ 
+     active = st.session_state.get("settings") or SupplyChainSettings()
+     section_head(tr("active_settings"), tr("active_settings"), tr("settings_note"))
+     chips = [
+         (tr("active_z"), f"{active.z_score:.2f}"),
+-        (tr("active_review"), f"{active.coverage_days} " + ("days" if lang() == "en" else "┘è┘ê┘à")),
++        (tr("active_review"), f"{active.review_period_days} " + ("days" if lang() == "en" else "┘è┘ê┘à")),
+         (tr("active_variance"), f"{active.variance_percent:.0f}%"),
+         (tr("active_basis"), mode_label("stock", active.stock_basis)),
+         (tr("active_demand"), mode_label("demand", active.demand_source)),
+@@ -2227,14 +2158,6 @@ def render_settings_page() -> None:
+             tr("active_substitutes"),
+             tr("enabled") if active.substitutes_enabled else tr("disabled"),
+         ),
+-        (
+-            tr("active_transfers"),
+-            tr("enabled") if active.include_transfers else tr("disabled"),
+-        ),
+-        (
+-            tr("active_ignore_no_sales"),
+-            tr("enabled") if active.ignore_no_sales_rate else tr("disabled"),
+-        ),
+         (
+             tr("active_warehouse"),
+             tr("deducted") if active.allocate_warehouse_stock else tr("not_deducted"),

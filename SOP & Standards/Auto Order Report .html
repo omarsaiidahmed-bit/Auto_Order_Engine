@@ -1,0 +1,174 @@
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>تقرير نظام الأوتو أوردر V2</title>
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Cairo', sans-serif;
+            background-color: #f8f9fa;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }
+        .page {
+            background-color: white;
+            width: 210mm;
+            min-height: 297mm;
+            margin: 0 auto 20px auto;
+            padding: 20mm;
+            box-sizing: border-box;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        @media print {
+            body { background-color: white; margin: 0; padding: 0; }
+            .page { box-shadow: none; margin: 0; page-break-after: always; }
+        }
+        h1, h2, h3 { color: #1a365d; }
+        .cover-title { text-align: center; margin-top: 100px; }
+        .cover-title h1 { font-size: 36px; margin-bottom: 10px; }
+        .cover-title p { font-size: 20px; color: #4a5568; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; }
+        th, td { border: 1px solid #cbd5e0; padding: 10px; text-align: right; }
+        th { background-color: #2b6cb0; color: white; }
+        tr:nth-child(even) { background-color: #edf2f7; }
+        
+        .mockup-box { border: 2px dashed #a0aec0; padding: 15px; border-radius: 8px; margin-bottom: 15px; background-color: #f7fafc; }
+        .btn-mockup { display: inline-block; background-color: #3182ce; color: white; padding: 8px 16px; border-radius: 4px; font-weight: bold; margin-bottom: 10px; }
+        .toggle-mockup { display: inline-block; width: 40px; height: 20px; background-color: #48bb78; border-radius: 10px; vertical-align: middle; margin-left: 10px; }
+        
+        ul, ol { line-height: 1.8; }
+        .highlight { color: #c53030; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <!-- صفحة الغلاف -->
+    <div class="page">
+        <div class="cover-title">
+            <h1>تقرير تقييم نظام الأوتو أوردر (V2)</h1>
+            <p>مقارنة بين النظام اليدوي الحالي والنظام الآلي الجديد</p>
+            <p>دليل التشغيل (SOP) والقيمة المضافة</p>
+            <br><br><br>
+            <p><strong>إعداد:</strong> إدارة تطوير النظم</p>
+            <p><strong>التاريخ:</strong> نوفمبر 2026</p>
+        </div>
+    </div>
+
+    <!-- صفحة 1: تحليل الوضع الحالي -->
+    <div class="page">
+        <h2>1. تحليل الوضع الحالي (As-Is Process)</h2>
+        <p>يعتمد النظام الحالي على الجهد اليدوي بشكل كامل، مما يستهلك الوقت ويجعل العملية عرضة للأخطاء البشرية:</p>
+        <ul>
+            <li><strong>استخراج البيانات:</strong> السحب اليدوي لـ 10 تقارير من PharmaFly (تقرير النواقص، كل الأصناف، رصيد الفرع، رصيد المخزن، مبيعات الشهر، مبيعات آخر 3 شهور، التحويلات، تحت التوريد، Pushing List، والأصناف متعددة الكروت).</li>
+            <li><strong>الدمج والمعادلات:</strong> استخدام دوال <code>VLOOKUP</code> لربط الأكواد و <code>SUMIFS</code> لتجميع الأرصدة، مع وجود أخطاء مستمرة وتضارب في الأكواد.</li>
+            <li><strong>معادلات خاطئة:</strong> إضافة التحويلات الصادرة إلى المبيعات (وهو خطأ يرهق المخزن)، وحساب الـ Demand بناءً على تقدير شخصي.</li>
+            <li><strong>قرارات شخصية:</strong> توزيع التجميل، اختيار البدائل، وتحديد الرواكد يتم بناءً على خبرة مسؤول الأوتو أوردر وليس معادلة علمية.</li>
+            <li class="highlight">النتيجة: ساعات طويلة من العمل، مخزون ميت (Dead Stock)، ونقص في أصناف حيوية.</li>
+        </ul>
+    </div>
+
+    <!-- صفحة 2: النظام الجديد V2 -->
+    <div class="page">
+        <h2>2. النظام الجديد (To-Be Process - Auto Order V2)</h2>
+        <p>يقوم النظام الجديد بأتمتة كل الخطوات السابقة لضمان الدقة والسرعة:</p>
+        <ul>
+            <li><strong>Smart Upload:</strong> رفع 10 ملفات بضغطة واحدة، مع دمج آلي (Pandas Merge) بدون حاجة لـ VLOOKUP.</li>
+            <li><strong>حسابات علمية:</strong> حساب (Daily Demand = Average / 30)، وتطبيق معادلة (s,S) لحساب الـ ROP و Target Level.</li>
+            <li><strong>Safety Stock:</strong> حساب علمي للاحتياطي الآمن (Z × σ × √LT) بناءً على الانحراف المعياري الحقيقي للمبيعات.</li>
+            <li><strong>تحكم كامل (Toggles):</strong> أزرار للتحكم في احتساب التحويلات، وتفعيل/إيقاف توزيع التجميل والـ Pushing List.</li>
+            <li><strong>أتمتة القرارات:</strong> استبعاد الرواكد تلقائياً، تغطية العجز بالبدائل فقط، وتوزيع التجميل آلياً.</li>
+            <li><strong>المخرجات:</strong> إخراج شيت احترافي بـ 20 عمود (يشمل القيمة المالية، تاريخ الوصول، تغطية المخزون، وسبب الطلب).</li>
+        </ul>
+    </div>
+
+    <!-- صفحة 3: جدول المقارنة -->
+    <div class="page">
+        <h2>3. جدول المقارنة الشامل</h2>
+        <table>
+            <tr>
+                <th>وجه المقارنة</th>
+                <th>النظام اليدوي الحالي</th>
+                <th>نظام V2 الجديد</th>
+            </tr>
+            <tr><td>استخراج البيانات</td><td>10 ملفات تُسحب وتُدمج يدوياً</td><td>رفع ذكي (Smart Upload) في ثوانٍ</td></tr>
+            <tr><td>دمج البيانات</td><td>VLOOKUP و SUMIFS (عرضة للخطأ)</td><td>Pandas Merge آلي ودقيق</td></tr>
+            <tr><td>المعادلات</td><td>تقدير شخصي</td><td>ROP و Target Level و Safety Stock</td></tr>
+            <tr><td>حساب الـ Demand</td><td>يعتمد على مبيعات متضاربة</td><td>Daily = Average / 30 (دقيق)</td></tr>
+            <tr><td>التحويلات</td><td>تُضاف على المبيعات (تفسد الحسابات)</td><td>معزولة ومربوطة بـ Toggle</td></tr>
+            <tr><td>الشهور التاريخية</td><td>تحديث يدوي</td><td>سحب ديناميكي لآخر 3 شهور</td></tr>
+            <tr><td>البدائل</td><td>اختيار شخصي</td><td>طلب العجز فقط آلياً</td></tr>
+            <tr><td>الرواكد</td><td>تظل في الشيت وتشتكي منها الإدارة</td><td>استبعاد آلي وتوثيق "راكد"</td></tr>
+            <tr><td>توزيع التجميل</td><td>تقدير شخصي</td><td>Force Push ذكي مربوط بـ Toggle</td></tr>
+            <tr><td>الأخطاء البشرية</td><td>عالية جداً</td><td>شبه معدومة (Fail-Fast)</td></tr>
+            <tr><td>الوقت المستغرق</td><td>ساعات أو أيام</td><td>ثوانٍ معدودة</td></tr>
+            <tr><td>الأعمدة المخرجة</td><td>16 عمود</td><td>20 عمود (مع القيمة المالية وتاريخ الوصول)</td></tr>
+        </table>
+    </div>
+
+    <!-- صفحة 4: دليل التشغيل SOP -->
+    <div class="page">
+        <h2>4. دليل التشغيل (SOP) - شرح الواجهة</h2>
+        <p>تم تصميم الواجهة لتكون سهلة وبسيطة، وفيما يلي شرح لكل عنصر:</p>
+
+        <div class="mockup-box">
+            <div class="btn-mockup">التاريخ (Order Date)</div> / <div class="btn-mockup">الفرع (Branch)</div>
+            <p>اختيار يوم عمل الطلبية والفرع المراد عمل الأوتو أوردر له. يؤثر التاريخ على حساب الـ Lead Time وسحب الشهور الديناميكية.</p>
+        </div>
+
+        <div class="mockup-box">
+            <div class="btn-mockup">رفع الملفات (File Upload)</div>
+            <p>10 صناديق مخصصة لرفع تقارير PharmaFly. يرجى التأكد من رفع كل تقرير في مكانه الصحيح.</p>
+        </div>
+
+        <h3>لوحة الإعدادات (Settings)</h3>
+        <div class="mockup-box">
+            <strong>طريقة الحساب (Order Method)</strong><br>
+            - <code>ROP</code> (نقطة إعادة الطلب): لا يطلب الصنف إلا لو نزل تحت حد معين.<br>
+            - <code>Target Level</code>: يطلب دايماً لحد ما يوصل للكمية المستهدفة.
+        </div>
+
+        <div class="mockup-box">
+            <strong>أيام التغطية (Coverage Days)</strong><br>
+            عدد الأيام التي نريد تغطيتها بعد وصول الطلبية (مثلاً 21 يوم).
+        </div>
+
+        <div class="mockup-box">
+            <div class="toggle-mockup"></div> <strong>تضمين التحويلات (Include Transfers)</strong><br>
+            مفتاح تشغيل/إيقاف. إذا كان مفعل، يخصم التحويلات الصادرة ويضيف الواردة.
+        </div>
+
+        <div class="mockup-box">
+            <div class="toggle-mockup"></div> <strong>تفعيل توزيع التجميل (Force Cosmetics)</strong><br>
+            إذا فُعل، يتم توزيع التجميل حتى لو لم تكن له مبيعات.
+        </div>
+
+        <div class="mockup-box">
+            <div class="toggle-mockup"></div> <strong>تفعيل Pushing List</strong><br>
+            إذا فُعل، يتم إجبار طلب الأصناف الموجودة في قائمة الـ Pushing.
+        </div>
+
+        <div class="mockup-box">
+            <div class="btn-mockup" style="background-color: #2f855a;">توليد الطلبية (Generate Order)</div>
+            <p>الزر النهائي الذي يقوم بكل الحسابات وتوليد ملف الإكسيل.</p>
+        </div>
+    </div>
+
+    <!-- صفحة 5: القيمة المضافة -->
+    <div class="page">
+        <h2>5. القيمة المضافة للشركة (Value Proposition)</h2>
+        <ul>
+            <li><strong>التحول من "التقدير" إلى "العلم":</strong> استخدام ROP و Safety Stock يحمي الشركة من الإغراق أو النقص.</li>
+            <li><strong>الشفافية المالية:</strong> عمود "القيمة المالية للطلب" يعطي الإدارة رؤية فورية لتكلفة الطلبية قبل اعتمادها.</li>
+            <li><strong>منع الهدر (Dead Stock):</strong> استبعاد الرواكد آلياً يحافظ على رأس المال.</li>
+            <li><strong>توفير الوقت:</strong> تقليص وقت عمل الأوتو أوردر من ساعات إلى ثوانٍ، مما يتيح للموظفين التركيز على مهام استراتيجية.</li>
+        </ul>
+        <br><br>
+        <h3 style="text-align: center; color: #2b6cb0;">شكراً لوقتكم.. مستعدون للأسئلة</h3>
+    </div>
+
+</body>
+</html>

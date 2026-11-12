@@ -1,0 +1,63 @@
+﻿diff --git "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\app_config.py" b/app_config.py
+index fb61580..0c45917 100644
+--- "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\app_config.py"
++++ b/app_config.py
+@@ -829,7 +829,7 @@ class SupplyChainSettings:
+ 
+     z_score: float = 1.65
+     variance_percent: float = DEFAULT_CV_FALLBACK * 100.0
+-    review_period_days: int = 21
++    review_period_days: int = 30
+     stock_basis: str = DEFAULT_STOCK_BASIS
+     demand_source: str = DEFAULT_DEMAND_SOURCE
+     order_method: str = DEFAULT_ORDER_METHOD
+@@ -840,7 +840,7 @@ class SupplyChainSettings:
+     substitute_require_same_pack_size: bool = False
+     requested_quantity_as_floor: bool = False
+     allocate_warehouse_stock: bool = True
+-    include_transfers: bool = False
++    include_transfers: bool = True
+     ignore_no_sales_rate: bool = False
+     enable_cosmetics_force: bool = False
+     enable_pushing_override: bool = False
+@@ -848,7 +848,7 @@ class SupplyChainSettings:
+ 
+     @property
+     def coverage_days(self) -> int:
+-        """The number of coverage days used by the Target formula."""
++        """The configured review period in days."""
+         return int(self.review_period_days)
+ 
+     def replaced(self, **changes: object) -> "SupplyChainSettings":
+@@ -859,7 +859,7 @@ class SupplyChainSettings:
+ SETTINGS_DEFAULTS: dict[str, object] = {
+     "z_score": 1.65,
+     "variance_percent": DEFAULT_CV_FALLBACK * 100.0,
+-    "review_period_days": 21,
++    "review_period_days": 30,
+     "stock_basis": DEFAULT_STOCK_BASIS,
+     "demand_source": DEFAULT_DEMAND_SOURCE,
+     "order_method": DEFAULT_ORDER_METHOD,
+@@ -870,7 +870,7 @@ SETTINGS_DEFAULTS: dict[str, object] = {
+     "substitute_require_same_pack_size": False,
+     "requested_quantity_as_floor": False,
+     "allocate_warehouse_stock": True,
+-    "include_transfers": False,
++    "include_transfers": True,
+     "ignore_no_sales_rate": False,
+     "enable_cosmetics_force": False,
+     "enable_pushing_override": False,
+@@ -957,7 +957,7 @@ __all__ = [
+ COSMETIC_CATEGORIES = frozenset({'Medical Cosmetics','┘à╪│╪¬╪¡╪╢╪▒╪º╪¬ ╪¬╪¼┘à┘è┘ä','┘à╪│╪¬┘ä╪▓┘à╪º╪¬ ╪╖╪¿┘è┘ç','┘à╪│╪¬┘ä╪▓┘à╪º╪¬ ╪╖╪¿┘è╪⌐','┘à╪│╪¬┘ä╪▓┘à╪º╪¬ ╪ú╪╖┘ü╪º┘ä','╪¡┘ü╪º╪╢╪º╪¬ ┘ê┘ê╪▒┘é┘è╪º╪¬','╪╡╪¿╪║╪º╪¬','┘à╪¿┘è╪»╪º╪¬ + ┘à┘å╪╕┘ü╪º╪¬','╪¿╪▒┘ü╪º┘å'})
+ COSMETIC_KEYWORDS = ('cosmetic','╪¬╪¼┘à┘è┘ä','╪¬╪¼┘à┘è┘ä┘è╪⌐','┘à╪│╪¬┘ä╪▓┘à╪º╪¬','╪¡┘ü╪º╪╢╪º╪¬','╪╡╪¿╪║','╪¿╪▒┘ü╪º┘å','╪┤╪º┘à╪¿┘ê','┘à┘å╪╕┘ü')
+ 
+-SUGGESTED_COVERAGE_DAYS = 21
++SUGGESTED_COVERAGE_DAYS = 30
+ SHORTAGE_COMPARISON_DAYS = 30
+ HISTORY_STUDY_DAYS = 90
+ TRANSFER_LOOKBACK_DAYS = 10
+@@ -969,4 +969,3 @@ MULTIPLE_CARDS_SHEET = 'Multiple Cards'
+ FINAL_BRANCH_SALES_SHEET = 'Final Branch Sales'
+ COSMETICS_DISTRIBUTION_SHEET = 'Cosmetics Distribution'
+ NOTES_SHEET = 'Notes'
+-

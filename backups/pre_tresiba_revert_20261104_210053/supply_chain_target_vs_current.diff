@@ -1,0 +1,356 @@
+﻿diff --git "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\supply_chain.py" "b/core\\supply_chain.py"
+index 7a8fc41..58eec0e 100644
+--- "a/C:\\Users\\omars\\AppData\\Local\\Temp\\opencode\\stage_target\\supply_chain.py"
++++ "b/core\\supply_chain.py"
+@@ -465,12 +465,16 @@ def process_data(
+     else:
+         merged["Effective_Stock"] = merged["Branch_Stock"] + merged["Pending_Purchases"] + merged["Transfers_In"] - merged["Transfers_Out"]
+ 
+-    daily_std_dev = monthly_std_dev / math.sqrt(review_period_days)
+-    daily_average = target_demand / review_period_days
++    # Daily demand is monthly demand / 30, not monthly demand / review period.
++    daily_std_dev = monthly_std_dev / math.sqrt(30.0)
++    daily_average = target_demand / 30.0
+     merged["Lead_Time"] = int(lead_time)
+     merged["Safety_Stock"] = z_score * daily_std_dev * math.sqrt(lead_time)
+     merged["ROP"] = daily_average * lead_time + merged["Safety_Stock"]
+-    exact_need = (target_demand + merged["Safety_Stock"]) - merged["Effective_Stock"]
++    target_level = daily_average * (
++        float(lead_time) + float(review_period_days)
++    )
++    exact_need = target_level - merged["Effective_Stock"]
+     merged["Calculated_Order"] = exact_need.where(merged["Effective_Stock"] <= merged["ROP"], 0.0)
+     merged["Calculated_Order"] = merged["Calculated_Order"].map(lambda quantity: max(0.0, float(quantity)))
+     merged["Order_Before_Pack_Rounding"] = merged["Calculated_Order"]
+@@ -546,7 +550,7 @@ def process_data(
+         "╪º┘ä╪¬╪╡┘å┘è┘ü",
+         "╪º┘ä┘â┘ê╪»",
+         "╪º┘ä╪º╪│┘à",
+-        "Final_Purchase_Order",
++        "Calculated_Order",
+         "╪¡╪º┘ä╪⌐ ╪º┘ä╪╡┘å┘ü",
+         "Effective_Stock",
+         "Warehouse_Stock",
+@@ -558,7 +562,7 @@ def process_data(
+         "┘à┘ä╪º╪¡╪╕╪º╪¬",
+     ]].copy()
+     result = result.rename(columns={
+-        "Final_Purchase_Order": "╪º┘ä┘à╪╖┘ä┘ê╪¿",
++        "Calculated_Order": "╪º┘ä┘à╪╖┘ä┘ê╪¿",
+         "Effective_Stock": "╪º┘ä┘à┘ê╪¼┘ê╪»",
+         "Warehouse_Stock": "╪º┘ä┘à╪«╪▓┘å",
+         "Lead_Time": "Lead_Time",
+@@ -1955,15 +1959,11 @@ def run_pipeline(
+ 
+     print(f"DEBUG: Calculating with Coverage Days = {settings.coverage_days}")
+ 
+-    if settings.order_method == "target":
+-        # Target Level: always order up to the target, with no ROP gate.
+-        raw_need = driver["Order_Up_To_Level"] - effective_stock
+-        triggers = pd.Series(True, index=driver.index)
+-    else:
+-        # ROP method: if the effective stock is above the ROP, no order is
+-        # raised.  Otherwise the quantity still covers the target level.
+-        raw_need = driver["Order_Up_To_Level"] - effective_stock
+-        triggers = effective_stock.le(driver["ROP"])
++    # The ROP gate is mandatory in the business rule.  ``order_method`` remains
++    # a UI compatibility flag, but it must not bypass the gate: if effective
++    # stock is above the reorder point, the branch need is zero.
++    raw_need = driver["Order_Up_To_Level"] - effective_stock
++    triggers = effective_stock.le(driver["ROP"])
+ 
+     raw_order = raw_need.where(triggers, 0.0)
+     print(
+@@ -2174,6 +2174,9 @@ def run_pipeline(
+         getattr(settings, "enable_pushing_override", False)
+     )
+     distribution_target = force_cosmetics | force_pushing
++    driver["Force_Cosmetics"] = force_cosmetics
++    driver["Force_Pushing"] = force_pushing
++    driver["Distribution_Target"] = distribution_target
+ 
+     driver["Stagnant_Flag"] = False
+     driver["Ignore_No_Sales_Flag"] = (
+@@ -2195,41 +2198,91 @@ def run_pipeline(
+         )
+ 
+     # Notes are kept, but the exact stagnant marker is appended below after the
+-    # final quantity is known.
+-    driver.loc[driver["Is_Pushing_List"], "┘à┘ä╪º╪¡╪╕╪º╪¬"] = "Pushing"
+-    driver.loc[
+-        driver["Is_Cosmetic"] & ~driver["Is_Pushing_List"], "┘à┘ä╪º╪¡╪╕╪º╪¬"
+-    ] = "╪¬┘ê╪▓┘è╪╣ ╪¬╪¼┘à┘è┘ä"
++    # final quantity is known.  Never replace an existing operational note
++    # (negative stock, substitute, pack rounding, ...) with the colour label.
++    for mask, label in (
++        (driver["Is_Pushing_List"], "Pushing"),
++        (
++            driver["Is_Cosmetic"]
++            & driver["Distribution_Target"]
++            & ~driver["Is_Pushing_List"],
++            "╪¬┘ê╪▓┘è╪╣ ╪¬╪¼┘à┘è┘ä",
++        ),
++    ):
++        existing = driver.loc[mask, "┘à┘ä╪º╪¡╪╕╪º╪¬"].fillna("").astype(str)
++        driver.loc[mask, "┘à┘ä╪º╪¡╪╕╪º╪¬"] = existing.apply(
++            lambda value, label=label: (
++                value
++                if label in value
++                else (f"{value} | {label}" if value.strip() else label)
++            )
++        )
++
++    # The warehouse-adjusted purchase amount is a separate logical layer.  Keep
++    # the main ``╪º┘ä┘à╪╖┘ä┘ê╪¿`` column on the branch need, but make the net purchase
++    # visible in the note so the buyer is not asked to infer it.
++    if bool(settings.allocate_warehouse_stock):
++        covered_quantity = pd.to_numeric(
++            driver["Warehouse_Covered"], errors="coerce"
++        ).fillna(0.0)
++        purchase_quantity_note = pd.to_numeric(
++            driver["Final_Purchase_Order"], errors="coerce"
++        ).fillna(0.0)
++        warehouse_note_mask = covered_quantity > 0
++        existing_notes = driver.loc[warehouse_note_mask, "┘à┘ä╪º╪¡╪╕╪º╪¬"].fillna("").astype(str)
++        driver.loc[warehouse_note_mask, "┘à┘ä╪º╪¡╪╕╪º╪¬"] = [
++            (f"{note} | " if note.strip() else "")
++            + f"╪╡╪º┘ü┘è ╪º┘ä╪┤╪▒╪º╪í ╪¿╪╣╪» ╪º┘ä┘à╪«╪▓┘å: {int(round(float(quantity)))}"
++            for note, quantity in zip(
++                existing_notes, purchase_quantity_note[warehouse_note_mask]
++            )
++        ]
+ 
+     # -- the four computed columns requested by the business -----------------
+     import datetime as _dt
+ 
+     expected_arrival_date = order_date + _dt.timedelta(days=lead_time)
+     driver["Expected_Arrival"] = str(expected_arrival_date)
++    # The exported ``╪º┘ä┘à╪╖┘ä┘ê╪¿`` column is the branch need, not the net purchase
++    # order.  Keep the financial value on the same basis so the sheet is
++    # internally consistent even when warehouse allocation is enabled.
+     driver["Financial_Value"] = (
++        pd.to_numeric(driver["Calculated_Order"], errors="coerce").fillna(0.0)
++        * pd.to_numeric(driver["Price"], errors="coerce").fillna(0.0)
++    )
++    # The warehouse-adjusted purchase layer stays available in diagnostics for
++    # the buyer and for the audit sheet; it is deliberately not the main column.
++    driver["Purchase_Financial_Value"] = (
+         pd.to_numeric(driver["Final_Purchase_Order"], errors="coerce").fillna(0.0)
+         * pd.to_numeric(driver["Price"], errors="coerce").fillna(0.0)
+     )
+     driver["Stock_Coverage_Days"] = (
+-        pd.to_numeric(driver["Branch_Stock"], errors="coerce").fillna(0.0)
++        pd.to_numeric(driver["Effective_Stock"], errors="coerce").fillna(0.0)
+         / pd.to_numeric(driver["Daily_Demand"], errors="coerce").replace(0, 1.0)
+     ).clip(lower=0)
+ 
+     def _order_reason(row: pd.Series) -> str:
+-        if row.get("Is_Pushing_List"):
++        # Source labels first, then the actual branch-need reason.  A cosmetic
++        # item is not automatically a distribution override; that label is only
++        # used when the explicit force toggle is on.
++        if bool(row.get("Is_Pushing_List")):
+             return "Pushing List"
+-        if row.get("Is_Cosmetic"):
+-            return "╪¬┘ê╪▓┘è╪╣ ╪¬╪¼┘à┘è┘ä"
+-        if row.get("Is_Transfer"):
++        if bool(row.get("Is_Transfer")):
+             return "╪¬╪¡┘ê┘è┘ä╪º╪¬"
+-        if row.get("Calculated_Order", 0) > 0:
++        if bool(row.get("Is_Cosmetic")) and bool(row.get("Distribution_Target")):
++            return "╪¬┘ê╪▓┘è╪╣ ╪¬╪¼┘à┘è┘ä"
++        try:
++            calculated = float(row.get("Calculated_Order", 0) or 0.0)
++        except (TypeError, ValueError):
++            calculated = 0.0
++        if calculated > 0:
+             return "┘å┘é╪╡ ┘ü┘è ╪º┘ä╪▒╪╡┘è╪»"
+         return "╪╖┘ä╪¿ ╪╣╪º╪»┘è"
+ 
+     driver["Order_Reason"] = driver.apply(_order_reason, axis=1)
+ 
+     # Stagnant: positive branch stock, no sales in any of the four displayed
+-    # months, and a zero final order.  The note is appended, never replaced.
++    # months, and a zero branch need.  The note is appended, never replaced.
+     stagnant_mask = (
+         (pd.to_numeric(driver["Branch_Stock"], errors="coerce").fillna(0.0) > 0)
+         & (
+@@ -2252,10 +2305,11 @@ def run_pipeline(
+         )
+         & (
+             pd.to_numeric(
+-                driver["Final_Purchase_Order"], errors="coerce"
++                driver["Calculated_Order"], errors="coerce"
+             ).fillna(0.0)
+             == 0
+         )
++        & (~driver["Distribution_Target"].fillna(False).astype(bool))
+     )
+     driver["Stagnant_Flag"] = stagnant_mask
+     _existing_notes = driver["┘à┘ä╪º╪¡╪╕╪º╪¬"].fillna("").astype(str)
+@@ -2270,10 +2324,15 @@ def run_pipeline(
+             "╪º┘ä╪¬╪╡┘å┘è┘ü": driver["Export_Category"].astype("string"),
+             "╪º┘ä┘â┘ê╪»": driver["╪º┘ä┘â┘ê╪»"].astype("string"),
+             "╪º┘ä╪º╪│┘à": driver["╪º╪│┘à ╪º┘ä╪╡┘å┘ü"].astype("string"),
+-            "╪º┘ä┘à╪╖┘ä┘ê╪¿": driver["Final_Purchase_Order"].astype("float64"),
++            # The main sheet is the branch need.  The warehouse-adjusted
++            # purchase quantity remains a separate diagnostics layer.
++            "╪º┘ä┘à╪╖┘ä┘ê╪¿": driver["Calculated_Order"].astype("float64"),
+             "╪º┘ä╪│╪╣╪▒": driver["Price"].astype("float64"),
+             "╪º┘ä┘é┘è┘à╪⌐ ╪º┘ä┘à╪º┘ä┘è╪⌐ ┘ä┘ä╪╖┘ä╪¿": driver["Financial_Value"].astype("float64"),
+-            "╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣": driver["Branch_Stock"].astype("float64"),
++            # Show the same net position used by the order calculation.
++            # The raw branch balance and pending purchases remain available
++            # separately in diagnostics.
++            "╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘ü╪▒╪╣": driver["Effective_Stock"].astype("float64"),
+             "╪º┘ä┘à┘ê╪¼┘ê╪» ┘ü┘è ╪º┘ä┘à╪«╪▓┘å": driver["Warehouse_Stock"].astype("float64"),
+             "╪º┘ä╪¬╪¡┘ê┘è┘ä╪º╪¬": driver["Net_Transfers"].astype("float64"),
+             sales_headers[0]: driver[sales_headers[0]].astype("float64"),
+@@ -2295,7 +2354,7 @@ def run_pipeline(
+     # zero (for example VOLTAREN at ROP).  The format is intentionally stable
+     # so a buyer or a test can grep a single SKU from the run output.
+     for debug_row in driver[
+-        ["╪º╪│┘à ╪º┘ä╪╡┘å┘ü", "Daily_Demand", "ROP", "Final_Purchase_Order"]
++        ["╪º╪│┘à ╪º┘ä╪╡┘å┘ü", "Daily_Demand", "ROP", "Calculated_Order"]
+     ].itertuples(index=False, name=None):
+         item, daily_value, rop_value, required_value = debug_row
+         daily_demand = float(daily_value) if pd.notna(daily_value) else 0.0
+@@ -2312,17 +2371,20 @@ def run_pipeline(
+         sales_months=sales_months,
+     )
+ 
+-    # Scope: every non-stagnant, non-ignored item with a positive requirement;
+-    # distribution rows are already forced to at least one.  There is no
+-    # shortage-report quantity override and no artificial shortage-only scope.
++    # Scope: every non-stagnant, non-ignored item with a positive branch need,
++    # plus every negative branch balance even when its calculated need is zero.
++    # A negative balance is an inventory error the buyer must see, so it must
++    # never be dropped by the ordinary positive-quantity filter.
+     required = pd.to_numeric(final["╪º┘ä┘à╪╖┘ä┘ê╪¿"], errors="coerce").fillna(0.0)
++    negative_branch = (
++        pd.to_numeric(driver["Branch_Stock"], errors="coerce").fillna(0.0) < 0
++    )
+     ordinary_keep = (
+-        (required > 0)
++        ((required > 0) | negative_branch)
+         & (~driver["Stagnant_Flag"])
+-        & (~driver["Ignore_No_Sales_Flag"])
++        & ((~driver["Ignore_No_Sales_Flag"]) | negative_branch)
+     )
+-    distribution_keep = distribution_target
+-    final = final.loc[ordinary_keep | distribution_keep].copy()
++    final = final.loc[ordinary_keep].copy()
+     final = final.sort_values(["╪º┘ä╪¬╪╡┘å┘è┘ü", "╪º┘ä┘â┘ê╪»"], kind="stable").reset_index(drop=True)
+ 
+     # Substitute rows are appended after the sorted sheet.
+@@ -2332,9 +2394,22 @@ def run_pipeline(
+     final = final.loc[:, export_columns].copy()
+     final_required = pd.to_numeric(final["╪º┘ä┘à╪╖┘ä┘ê╪¿"], errors="coerce").fillna(0.0)
+     final["╪º┘ä┘à╪╖┘ä┘ê╪¿"] = np.ceil(final_required.clip(lower=0.0)).astype("int64")
+-    final = final.loc[final["╪º┘ä┘à╪╖┘ä┘ê╪¿"] > 0].reset_index(drop=True)
++    negative_branch_codes = set(
++        _clean_code_series(
++            driver.loc[negative_branch, "╪º┘ä┘â┘ê╪»"]
++        ).dropna().astype(str)
++    )
++    final_negative_branch = _clean_code_series(final["╪º┘ä┘â┘ê╪»"]).isin(
++        negative_branch_codes
++    )
++    final = final.loc[(final["╪º┘ä┘à╪╖┘ä┘ê╪¿"] > 0) | final_negative_branch].reset_index(
++        drop=True
++    )
+     if final.empty:
+-        raise ValueError("There are no items with a positive required quantity.")
++        raise ValueError(
++            "There are no items with a positive required quantity or a negative "
++            "branch balance."
++        )
+ 
+     # Keep the colour decision on the frame itself.  The exporter also accepts
+     # the flags from diagnostics, but this makes the priority explicit and
+@@ -2478,18 +2553,26 @@ def run_pipeline(
+     # The quantity and the cost follow the **exported sheet**, so the extra
+     # substitute lines are counted in both.
+     substituted_count = int(driver["Substituted_Out"].sum())
+-    catalogue_quantity = float(driver["Final_Purchase_Order"].sum())
++    included = driver.loc[ordinary_keep]
++    catalogue_quantity = float(included["Calculated_Order"].sum())
++    purchase_quantity = float(included["Final_Purchase_Order"].sum())
+     substitute_quantity = (
+         float(substitute_rows["╪º┘ä┘à╪╖┘ä┘ê╪¿"].sum()) if not substitute_rows.empty else 0.0
+     )
+     estimated_cost = float(
+-        (driver["Final_Purchase_Order"] * driver["Unit_Cost"]).sum()
++        (included["Calculated_Order"] * included["Unit_Cost"]).sum()
++    ) + substitute_cost
++    purchase_estimated_cost = float(
++        (included["Final_Purchase_Order"] * included["Unit_Cost"]).sum()
+     ) + substitute_cost
+     metrics = {
+         "total_items": int(len(driver)),
+         "total_rows": int(len(final)),
+         "total_order_quantity": catalogue_quantity + substitute_quantity,
++        "purchase_order_quantity": purchase_quantity + substitute_quantity,
+         "estimated_cost": estimated_cost,
++        "purchase_estimated_cost": purchase_estimated_cost,
++        "warehouse_covered_quantity": float(included["Warehouse_Covered"].sum()),
+         "zero_stock_count": int((driver["Effective_Stock"] <= 0).sum()),
+         "negative_stock_count": int((driver["Effective_Stock"] < 0).sum()),
+         "items_ordered": int((final["╪º┘ä┘à╪╖┘ä┘ê╪¿"] > 0).sum()),
+@@ -2511,14 +2594,13 @@ def run_pipeline(
+     # -- the stock reconciliation strip --------------------------------------
+     reconciliation = _build_reconciliation(driver, settings)
+ 
+-    # FAIL-FAST: verify no unexpected override changed the result.
+-    _calc_sum = float(
+-        pd.to_numeric(driver["Calculated_Order"], errors="coerce").fillna(0).sum()
+-    )
+-    _wh_sum = float(
+-        pd.to_numeric(driver["Warehouse_Covered"], errors="coerce").fillna(0).sum()
++    # FAIL-FAST: verify no unexpected override changed the branch-need column.
++    # The main sheet is Calculated_Order, not Calculated_Order - Warehouse.
++    _included_calc = float(
++        pd.to_numeric(
++            driver.loc[ordinary_keep, "Calculated_Order"], errors="coerce"
++        ).fillna(0).sum()
+     )
+-    _expected_final = max(_calc_sum - _wh_sum, 0.0)
+     _actual_final = float(
+         pd.to_numeric(final["╪º┘ä┘à╪╖┘ä┘ê╪¿"], errors="coerce").fillna(0).sum()
+     )
+@@ -2531,13 +2613,13 @@ def run_pipeline(
+         if "Substitute_Request" in driver.columns
+         else 0.0
+     )
+-    _expected_with_subs = _expected_final + _substitute_allowance
++    _expected_with_subs = _included_calc + _substitute_allowance
+     if abs(_actual_final - _expected_with_subs) > max(
+         1.0, _expected_with_subs * 0.01
+     ):
+         print(
+             f"ΓÜá∩╕Å FAIL-FAST WARNING: Final ({_actual_final}) Γëá "
+-            f"Calculated - WH ({_expected_final}) + Subs "
++            f"Included Calculated ({_included_calc}) + Subs "
+             f"({_substitute_allowance})"
+         )
+         print(f"   Difference: {_actual_final - _expected_with_subs}")
+@@ -2562,14 +2644,14 @@ def _build_item_status(driver: pd.DataFrame) -> pd.Series:
+ 
+     The rules are applied in order, and the first match wins:
+ 
+-    * a positive purchase order -> ``┘è╪¡╪¬╪º╪¼ ╪╖┘ä╪¿``;
+-    * a zero order with enough stock for the whole month -> ``┘à╪║╪╖┘ë ╪¿╪º┘ä┘â╪º┘à┘ä``;
+-    * a zero order that is still above the reorder point -> covered up to the
+-      supply period;
++    * a positive branch need -> ``┘è╪¡╪¬╪º╪¼ ╪╖┘ä╪¿``;
++    * a zero branch need with enough stock for the whole month -> ``┘à╪║╪╖┘ë ╪¿╪º┘ä┘â╪º┘à┘ä``;
++    * a zero branch need that is still above the reorder point -> covered up to
++      the supply period;
+     * anything else stays blank.
+     """
+     status = pd.Series("", index=driver.index, dtype="string")
+-    status = status.mask(driver["Final_Purchase_Order"] > 0, ITEM_STATUS_ORDER)
++    status = status.mask(driver["Calculated_Order"] > 0, ITEM_STATUS_ORDER)
+ 
+     zero_order = driver["Calculated_Order"] == 0
+     fully_covered = zero_order & (
