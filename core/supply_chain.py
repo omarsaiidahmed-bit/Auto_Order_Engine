@@ -97,6 +97,7 @@ from core.demand import (
     SIGMA_SOURCE_PANEL,
     SIGMA_SOURCE_RECENT,
     DemandSpine,
+    aggregate_family_demand,
     build_demand_spine,
     detect_sales_window_days,
     recent_monthly_statistics,
@@ -2040,10 +2041,6 @@ def run_pipeline(
         triggers = effective_stock.le(driver["ROP"])
 
     raw_order = raw_need.where(triggers, 0.0)
-    print(
-        f"DEBUG: order_method={settings.order_method} | "
-        f"ROP_triggers={int(triggers.sum()) if hasattr(triggers, 'sum') else 0}"
-    )
     driver["Calculated_Order"] = np.maximum(
         np.ceil(raw_order.to_numpy(dtype="float64")), 0.0
     ).astype("float64")
@@ -2127,8 +2124,16 @@ def run_pipeline(
 
     # -- the category ---------------------------------------------------------
     # Copied verbatim: the ERP's own classification is the one the buyer works
-    # with, so nothing is renamed and nothing falls into a generic bucket.
-    driver["Export_Category"] = driver["Raw_Category"].astype("string").fillna("")
+    # with.  Missing values are made explicit here so an empty category can
+    # never reach the workbook as a blank, crash-prone cell.
+    driver["Export_Category"] = (
+        driver["Raw_Category"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("غير محدد")
+        .astype("string")
+    )
 
     # -- the cost -------------------------------------------------------------
     average_cost = pd.to_numeric(driver["متوسط سعر التكلفة"], errors="coerce")
@@ -2304,11 +2309,85 @@ def run_pipeline(
             "تم استبداله بالصنف " + substitute_codes[substituted_out]
         )
 
-    # -- shared product-name stock pooling -----------------------------------
-    # Different item codes can point at the same physical product.  Pool
-    # their branch stock before the financial/status fields below are written.
+    # -- shared product-name branch pooling ----------------------------------
+    # Different item codes can point at the same physical product.  Pool their
+    # branch stock before the financial/status fields below are written.  The
+    # warehouse part is deliberately left to the family waterfall so an exact
+    # multi-price sibling always wins over a general-warehouse card.
     shared_name_adjustment = _apply_shared_name_coverage(
-        driver, allocate_warehouse=settings.allocate_warehouse_stock
+        driver, allocate_warehouse=False
+    )
+    shared_covered_out = (
+        driver.get("Shared_Covered_Out", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # -- the family warehouse waterfall ---------------------------------------
+    # Shared-name pooling above covered branch stock only.  This pass applies
+    # the ordered warehouse waterfall: exact multi-price sibling, exact general
+    # warehouse card, old-price/inactive exact sibling, then a different size
+    # only when no exact size has stock anywhere.  A fully covered line stays
+    # at zero and is not written as a purchase order.
+    shared_name_adjustment += _apply_family_warehouse_coverage(
+        driver, multi_price
+    )
+    family_covered_out = (
+        driver.get("Family_Covered_Out", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+
+    # -- old-price and multi-price card transfer -----------------------------
+    # The transfer shifts quantity between two existing cards, so its net
+    # effect on the FAIL-FAST denominator is zero.  The per-row correction is
+    # made inside the helper through Shared_Name_Adjustment.
+    sibling_transfer = _apply_sibling_order_transfer(driver, multi_price)
+
+    # -- independent demand + sibling shortage transfer ----------------------
+    # Calculated_Order is never changed here.  Each card consumes its own
+    # warehouse stock, and only the remaining shortage is moved to a sibling
+    # card with spare warehouse stock.  The transfer is written to
+    # Shared_Name_Adjustment so the FAIL-FAST identity still reconciles.
+    _apply_family_aggregation(
+        driver,
+        protected=distribution_target | substituted_out,
+    )
+    # The family pass rewrites the adjustment for every transferred row.  Read
+    # the exact column back instead of trusting the earlier running total.
+    shared_name_adjustment = float(
+        pd.to_numeric(
+            driver["Shared_Name_Adjustment"], errors="coerce"
+        )
+        .fillna(0.0)
+        .sum()
+    )
+
+    # The exported purchase quantity is always a whole pack.  Round it once,
+    # here, after every stock/name/sibling rule has run.  The tiny per-row
+    # difference is recorded in Shared_Name_Adjustment so the fail-fast
+    # identity still reconciles the exact exported total, never an inflated
+    # pre-rounding quantity.
+    exact_final = pd.to_numeric(
+        driver["Final_Purchase_Order"], errors="coerce"
+    ).fillna(0.0).clip(lower=0.0)
+    rounded_final = np.ceil(exact_final.to_numpy(dtype="float64"))
+    rounding_delta = rounded_final - exact_final.to_numpy(dtype="float64")
+    driver["Final_Purchase_Order"] = rounded_final.astype("float64")
+    driver["Shared_Name_Adjustment"] = (
+        pd.to_numeric(
+            driver["Shared_Name_Adjustment"], errors="coerce"
+        ).fillna(0.0)
+        + rounding_delta
+    )
+    shared_name_adjustment += float(np.sum(rounding_delta))
+    sibling_transfer_out = (
+        driver.get(
+            "Sibling_Transfer_Out",
+            pd.Series(False, index=driver.index),
+        )
+        .fillna(False)
+        .astype(bool)
     )
 
     # -- the four computed columns requested by the business -----------------
@@ -2333,6 +2412,27 @@ def run_pipeline(
             except (TypeError, ValueError):
                 return bool(value)
 
+        if _flag("Different_Size_Covered_Out"):
+            return "مغطى من نفس الصنف (حجم مختلف)"
+        if _flag("Family_Aggregated"):
+            status = _clean_text(row.get("Family_Aggregation_Status"))
+            if status == "covered":
+                return "مغطى من إجمالي رصيد العائلة"
+            if status == "ordered":
+                return "طلب مجمع للعائلة"
+            if status == "stagnant":
+                return "راكد - لا يحتاج طلب"
+            if status == "transfer":
+                note = _clean_text(row.get("ملاحظات"))
+                if any("\u0600" <= char <= "\u06ff" for char in note):
+                    return note
+                return "تم توزيع النقص على كارتة بديلة"
+        if _flag("Family_Covered_Out"):
+            return "مغطى من نفس الصنف"
+        if _flag("Shared_Covered_Out"):
+            return "مغطى من نفس الصنف"
+        if _flag("Sibling_Transfer_Out"):
+            return "تم النقل لكارتة أخرى"
         if _flag("Substituted_Out"):
             return "مستبدل بصنف آخر"
         if _flag("Is_Pushing_List"):
@@ -2359,6 +2459,9 @@ def run_pipeline(
     # months, and a zero final order.  The note is appended, never replaced.
     stagnant_mask = (
         (~substituted_out)
+        & (~sibling_transfer_out)
+        & (~family_covered_out)
+        & (~shared_covered_out)
         & (pd.to_numeric(driver["Branch_Stock"], errors="coerce").fillna(0.0) > 0)
         & (
             pd.to_numeric(
@@ -2405,7 +2508,9 @@ def run_pipeline(
     export_columns = export_columns_for_date(order_date)
     final = pd.DataFrame(
         {
-            "التصنيف": driver["Export_Category"].astype("string"),
+            "التصنيف": driver["Export_Category"]
+            .astype("string")
+            .fillna("غير محدد"),
             "الكود": driver["الكود"].astype("string"),
             "الاسم": driver["اسم الصنف"].astype("string"),
             "المطلوب": driver["Final_Purchase_Order"].astype("float64"),
@@ -2429,18 +2534,54 @@ def run_pipeline(
         }
     ).loc[:, export_columns]
 
+    # -- category merge safety ------------------------------------------------
+    # Re-attach the ERP category through a normalised text key.  Both sides are
+    # cast to string and stripped before the (one-row-per-code) merge, so a
+    # numeric master code such as ``43217.0`` cannot silently fail to match the
+    # catalogue code ``43217`` and leave التصنيف empty.
+    final = final.reset_index(drop=True)
+    final["_Code_Key"] = _clean_code_series(final["الكود"])
+    if "فئة التصنيف" in master.columns and "كود الصنف" in master.columns:
+        category_lookup = master.loc[:, ["كود الصنف", "فئة التصنيف"]].copy()
+        category_lookup["_Code_Key"] = _clean_code_series(
+            category_lookup["كود الصنف"]
+        )
+        category_lookup["_Master_Category"] = (
+            category_lookup["فئة التصنيف"]
+            .astype("string")
+            .str.strip()
+            .replace("", pd.NA)
+        )
+        category_lookup = category_lookup.loc[
+            category_lookup["_Code_Key"].notna()
+            & category_lookup["_Code_Key"].ne("")
+            & category_lookup["_Master_Category"].notna()
+        ].drop_duplicates("_Code_Key", keep="first")
+        if not category_lookup.empty:
+            mapped = final[["_Code_Key"]].merge(
+                category_lookup[["_Code_Key", "_Master_Category"]],
+                on="_Code_Key",
+                how="left",
+                sort=False,
+                validate="m:1",
+            )["_Master_Category"]
+            mapped.index = final.index
+            final["التصنيف"] = final["التصنيف"].astype("string").mask(
+                mapped.notna(), mapped
+            )
+    final["التصنيف"] = (
+        final["التصنيف"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("غير محدد")
+        .astype("string")
+    )
+    final = final.drop(columns="_Code_Key")
+
     # -- the requested calculation trace -------------------------------------
-    # One line per catalogue item, including items whose required quantity is
-    # zero (for example VOLTAREN at ROP).  The format is intentionally stable
-    # so a buyer or a test can grep a single SKU from the run output.
-    for debug_row in driver[
-        ["اسم الصنف", "Daily_Demand", "ROP", "Final_Purchase_Order"]
-    ].itertuples(index=False, name=None):
-        item, daily_value, rop_value, required_value = debug_row
-        daily_demand = float(daily_value) if pd.notna(daily_value) else 0.0
-        rop = float(rop_value) if pd.notna(rop_value) else 0.0
-        required = int(max(float(required_value), 0.0)) if pd.notna(required_value) else 0
-        print(f"DEBUG: {item} | Daily: {daily_demand} | ROP: {rop} | Req: {required}")
+    # The per-item DEBUG trace was removed from the production pipeline; the
+    # diagnostics frame and the final sheet carry the same information.
 
     # Build the substitute lines before applying the ordinary positive filter.
     # The substitute's own order stays exactly as calculated, but its display
@@ -2477,7 +2618,27 @@ def run_pipeline(
         & (~driver["Ignore_No_Sales_Flag"])
     )
     distribution_keep = distribution_target
-    final["_Keep_Zero"] = substituted_out.reindex(final.index).fillna(False).astype(bool)
+    # A transferred source line is kept at zero so the buyer can see both the
+    # card that released the quantity and the card that received it.
+    final["_Keep_Zero"] = (
+        substituted_out.reindex(final.index).fillna(False)
+        | sibling_transfer_out.reindex(final.index).fillna(False)
+        | family_covered_out.reindex(final.index).fillna(False)
+        | shared_covered_out.reindex(final.index).fillna(False)
+        | driver.get(
+            "Family_Aggregated", pd.Series(False, index=driver.index)
+        )
+        .reindex(final.index)
+        .fillna(False)
+        .astype(bool)
+        | driver.get(
+            "Different_Size_Covered_Out",
+            pd.Series(False, index=driver.index),
+        )
+        .reindex(final.index)
+        .fillna(False)
+        .astype(bool)
+    ).astype(bool)
     final = final.loc[
         ordinary_keep | distribution_keep | final["_Keep_Zero"]
     ].copy()
@@ -2708,6 +2869,8 @@ def run_pipeline(
         pd.to_numeric(final["المطلوب"], errors="coerce").fillna(0).sum()
     )
     _difference = _actual_final - _expected_with_subs
+    if abs(_difference) < 1e-9:
+        _difference = 0.0
     _substitute_deduction = float(
         pd.to_numeric(driver["Substitutes"], errors="coerce").fillna(0).sum()
     )
@@ -2732,6 +2895,9 @@ def run_pipeline(
         data_by_role,
     )
     metrics["missing_items"] = int(len(missing_items))
+    # The exporter accepts the report explicitly and through the diagnostics
+    # frame, so either call style produces the exact second worksheet.
+    diagnostics.attrs["missing_items"] = missing_items
     try:
         report_path = (
             Path(missing_report_path)
@@ -2793,32 +2959,77 @@ def _build_item_status(driver: pd.DataFrame) -> pd.Series:
 # ---------------------------------------------------------------------------
 # Shared product-name stock pooling
 # ---------------------------------------------------------------------------
-#: Trailing buyer suffixes that do not identify a different product.
-_TRAILING_NAME_SUFFIX_RE = re.compile(
-    r"\s*(?:س\s*\.?\s*ق)\s*$",
+#: Old-price markers and the inactive marker do not identify a product.  They
+#: describe the commercial state of a card, so they are removed before names
+#: are compared.  The marker may appear in the middle of a manually edited name
+#: (``ZOLO س.ق 20TAB``), not only as a trailing suffix.
+_OLD_PRICE_MARKER_RE = re.compile(
+    r"(?<!\w)س\s*\.*\s*ق(?!\w)",
+    re.IGNORECASE,
+)
+_INACTIVE_MARKER_RE = re.compile(
+    r"(?<!\w)لاغي(?!\w)",
+    re.IGNORECASE,
+)
+
+#: Location codes are shelf/bin labels typed into the item name.  They are not
+#: part of the product identity.  Examples: ``11M5``, ``C14``, ``1 A 1`` and
+#: ``8A2``.  Only a code at the **end** of the name is removed; a meaningful
+#: token such as ``B12`` in the middle of a product name is preserved.
+_LOCATION_SUFFIX_RE = re.compile(
+    r"(?:\s+|^)(?:"
+    r"\d{1,2}\s*[A-Z]\s*\d{1,2}"
+    r"|[A-Z]{1,2}\s*\d{1,2}"
+    r")\s*$",
     re.IGNORECASE,
 )
 
 #: Sellable size tokens.  They are the safety guard against grouping 75GM and
 #: 150GM even when every other token is identical.  ``##`` is a generic size
-#: marker, not a sellable size: its presence/absence does not change the
-#: product, so it is ignored when the comparison key is built.
+#: placeholder: it is ignored by the exact-name grouping key, but the warehouse
+#: waterfall treats a hash/no-hash mismatch as a different size.
 _SIZE_TOKEN_RE = re.compile(
     r"(?<!\w)(\d+(?:\.\d+)?)\s*"
     r"(GM|G|MG|ML|L|KG|MCG|IU|%|TAB|CAPS|SACHET|PCS|STRIPS|VIAL|جم|مل|جرام|ملجم)(?!\w)"
     r"|(#+)",
     re.IGNORECASE,
 )
+#: ``##`` is a generic size placeholder.  It is ignored by the exact-name
+#: grouping key, but the warehouse waterfall treats a hash/no-hash mismatch as
+#: a different size so it is only used as the absolute last resort.
+_HASH_SIZE_RE = re.compile(r"#+")
 
 
 def _normalise_group_name(value: object) -> str:
-    """Return the comparison key used to pool cards of one product."""
+    """Return the comparison key used to pool cards of one product.
+
+    Cleaning is deliberately strict:
+
+    * old-price markers (``س.ق`` / ``س..ق``) and ``لاغي`` are removed;
+    * a trailing location code (``11M5``, ``C14``, ``1 A 1``, ``8A2``) is
+      removed;
+    * size tokens are **not** removed here.  They are part of
+      :func:`_group_identity`, so two different sizes stay separate while still
+      sharing the same :func:`_base_name` family.
+    """
     text = normalize_arabic_text(value).upper()
+    text = _OLD_PRICE_MARKER_RE.sub(" ", text)
+    text = _INACTIVE_MARKER_RE.sub(" ", text)
     previous = None
     while text != previous:
         previous = text
-        text = _TRAILING_NAME_SUFFIX_RE.sub("", text).strip()
+        text = _LOCATION_SUFFIX_RE.sub("", text).strip()
     return " ".join(text.split())
+
+
+def _base_name(value: object) -> str:
+    """Return the family base name: the name without any size token.
+
+    This is the key that lets ``MILGA 20TAB`` and ``MILGA 40TAB`` be inspected
+    as a family, while still keeping ``MILGA`` and ``MILGA ADVANCE`` separate.
+    """
+    normalised = _normalise_group_name(value)
+    return " ".join(_SIZE_TOKEN_RE.sub(" ", normalised).split())
 
 
 def _group_identity(name: str) -> str:
@@ -2827,20 +3038,25 @@ def _group_identity(name: str) -> str:
     Two cards belong to the same product only when this key is **exactly**
     identical.  The only tolerated spelling differences are:
 
-    * a trailing ``س.ق`` (already removed by :func:`_normalise_group_name`);
-    * a ``##`` size marker, which is ignored;
+    * old-price/inactive markers and trailing location codes (removed by
+      :func:`_normalise_group_name`);
+    * a ``##`` size marker, which is ignored for exact-name pooling (the
+      warehouse waterfall separately treats a hash/no-hash mismatch as a
+      different size);
     * whitespace inside a size token (``30 TAB`` == ``30TAB``).
 
     Different sizes (``30TAB`` vs ``60TAB``) and any different word
-    (``MAN`` vs ``WOMAN``) produce a different key and therefore never group.
+    (``MAN`` vs ``WOMAN``, ``ALPHINTERN`` vs ``ALPHINWELL``) produce a
+    different key and therefore never group.
     """
+    normalised = _normalise_group_name(name)
     sizes: set[str] = set()
-    for match in _SIZE_TOKEN_RE.finditer(name):
+    for match in _SIZE_TOKEN_RE.finditer(normalised):
         raw = match.group(0)
         if raw.lstrip().startswith("#"):
             continue
         sizes.add(re.sub(r"\s+", "", raw).upper())
-    base = " ".join(_SIZE_TOKEN_RE.sub(" ", name).split())
+    base = " ".join(_SIZE_TOKEN_RE.sub(" ", normalised).split())
     return f"{base}|{','.join(sorted(sizes))}"
 
 
@@ -2910,15 +3126,21 @@ def _apply_shared_name_coverage(
         driver["Calculated_Order"], errors="coerce"
     ).fillna(0.0)
     branch = pd.to_numeric(driver["Branch_Stock"], errors="coerce").fillna(0.0)
+    # Keep the exact pack-equivalent value.  A warehouse balance of 1.75 is
+    # real stock, so it must never be floored before it covers demand.
     warehouse = (
         pd.to_numeric(driver["Warehouse_Stock"], errors="coerce")
         .fillna(0.0)
         .clip(lower=0.0)
-        .apply(math.floor)
     )
     codes = driver["الكود"].astype("string").fillna("").str.strip()
     substituted = (
         driver.get("Substituted_Out", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    family_aggregated = (
+        driver.get("Family_Aggregated", pd.Series(False, index=driver.index))
         .fillna(False)
         .astype(bool)
     )
@@ -2985,6 +3207,10 @@ def _apply_shared_name_coverage(
             transferred_in.loc[group].gt(0.0).any()
         ):
             continue
+        # Rule 1 owns these rows.  Shared-name branch pooling must not replace
+        # the family note or reduce a pooled family order a second time.
+        if bool(family_aggregated.loc[group].any()):
+            continue
 
         positions = {idx: position for position, idx in enumerate(group)}
         total_order = float(calculated.loc[group].sum())
@@ -3044,8 +3270,8 @@ def _apply_shared_name_coverage(
         driver.at[primary, "Warehouse_Covered"] = covered_qty
         driver.at[primary, "Final_Purchase_Order"] = primary_final
 
-        primary_note = f"الطلب محوّل لكارتة {primary_code} (لها رصيد مخزن)"
-        others_note = f"مغطى عبر كارتة {primary_code}"
+        primary_note = f"مغطى من نفس الصنف (كارتة: {primary_code})"
+        others_note = f"مغطى من نفس الصنف (كارتة: {primary_code})"
         driver.at[primary, "ملاحظات"] = primary_note
         driver.at[primary, "Shared_Name_Note"] = primary_note
         for idx in group:
@@ -3068,6 +3294,16 @@ def _apply_shared_name_coverage(
         .fillna(0.0)
         > 0.0
     )
+    # A card that had a calculated requirement but ended at zero because an
+    # exact sibling supplied the stock must remain visible, exactly like a
+    # family-covered or transferred row.
+    driver["Shared_Covered_Out"] = (
+        calculated.gt(0.0)
+        & pd.to_numeric(driver["Final_Purchase_Order"], errors="coerce")
+        .fillna(0.0)
+        .le(0.0)
+        & driver["Shared_Name_Note"].fillna("").astype(str).str.strip().ne("")
+    )
     if {"Effective_Stock", "Target_Demand", "ROP"}.issubset(driver.columns):
         driver["Item_Status"] = _build_item_status(driver)
 
@@ -3076,6 +3312,926 @@ def _apply_shared_name_coverage(
         .fillna(0.0)
         .sum()
     )
+
+
+def _apply_family_aggregation(
+    driver: pd.DataFrame,
+    *,
+    protected: pd.Series | None = None,
+) -> int:
+    """Allocate each card independently, then move its shortage to a sibling.
+
+    ``Calculated_Order`` is never changed.  The three rules are:
+
+    1. each card keeps the independent requirement already calculated from its
+       own average / ROP and branch stock;
+    2. each card consumes its own warehouse first, and the remainder is its
+       shortage;
+    3. a shortage is transferred to an exact sibling that still has spare
+       warehouse stock.  The receiving card adds the transfer to its own
+       requirement and consumes the total from its warehouse.  If no sibling
+       has spare stock, the shortage stays on the original card.
+
+    ``Final_Purchase_Order`` is recalculated from the transfer result.  A card
+    that transferred its whole shortage ends at zero; a receiving card also
+    ends at zero when its warehouse covered its own requirement plus the
+    transfer.  The transfer itself is written to ``Shared_Name_Adjustment`` as
+    a negative amount on the source and a positive amount on the receiver, so
+    ``Calculated - Warehouse_Covered + Shared_Name_Adjustment`` still equals
+    the final quantity row by row.
+
+    The full audit trail is kept in ``Own_Warehouse_Consumed``, ``Shortage``,
+    ``Family_Shortage_Transferred``, ``Family_Shortage_Received``,
+    ``Warehouse_Consumption_Total`` and ``Shortage_After_Transfer``.  Stock is
+    never floored: fractional warehouse balances are consumed as they are.
+    """
+
+    required = {
+        "الكود",
+        "اسم الصنف",
+        "Calculated_Order",
+        "Warehouse_Stock",
+    }
+    if driver is None or driver.empty or not required.issubset(driver.columns):
+        return 0
+
+    codes = _clean_code_series(driver["الكود"])
+    codes = codes.astype("string").fillna("").str.strip()
+    names = driver["اسم الصنف"].astype("string").fillna("")
+    identities = names.map(
+        lambda value: (
+            _group_identity(_normalise_group_name(value))
+            if _normalise_group_name(value)
+            else ""
+        )
+    )
+    keys = identities.astype("string").fillna("").copy()
+    empty_keys = keys.eq("")
+    if bool(empty_keys.any()):
+        keys.loc[empty_keys] = [
+            f"__row_{position}"
+            for position, is_empty in enumerate(empty_keys.to_numpy())
+            if bool(is_empty)
+        ]
+
+    calculated = (
+        pd.to_numeric(driver["Calculated_Order"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+        .astype("float64")
+    )
+    warehouse = (
+        pd.to_numeric(driver["Warehouse_Stock"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+        .astype("float64")
+    )
+    own_consumed = np.minimum(calculated, warehouse)
+    shortage = (calculated - own_consumed).clip(lower=0.0)
+    available = (warehouse - own_consumed).clip(lower=0.0)
+
+    protected_mask = (
+        protected.reindex(driver.index).fillna(False).astype(bool)
+        if protected is not None
+        else pd.Series(False, index=driver.index, dtype=bool)
+    )
+
+    new_columns: dict[str, object] = {
+        "Own_Warehouse_Consumed": 0.0,
+        "Shortage": 0.0,
+        "Shortage_After_Transfer": 0.0,
+        "Warehouse_Consumption_Total": 0.0,
+        "Family_Shortage_Received": 0.0,
+        "Family_Shortage_Transferred": 0.0,
+        "Family_Transfer_From": "",
+        "Family_Transfer_To": "",
+        "Family_Aggregated": False,
+        "Family_Aggregation_Status": "",
+        "Family_Target_Total": 0.0,
+        "Family_Stock_Total": 0.0,
+        "Family_Net_Need": 0.0,
+        "Family_Group_Size": 0,
+        "Family_Average_Sum": 0.0,
+        "Family_Calculated_Sum": 0.0,
+        "Family_Branch_Stock": 0.0,
+        "Family_Warehouse_Stock": 0.0,
+        "Family_Covered_Out": False,
+        "Family_Covered_By": "",
+        "Family_Coverage_Amount": 0.0,
+        "Family_Coverage_Kind": "",
+        "Family_Ordered_Out": False,
+        "Different_Size_Covered_By": "",
+        "Different_Size_Coverage_Amount": 0.0,
+        "Different_Size_Covered_Out": False,
+        "Shared_Name_Adjustment": 0.0,
+        "Shared_Name_Note": "",
+        "Shared_Covered_Out": False,
+        "Sibling_Transfer_Out": False,
+        "Warehouse_Loading": False,
+        "Final_Purchase_Order": 0.0,
+    }
+    for column, default in new_columns.items():
+        if column not in driver.columns:
+            driver[column] = default
+
+    driver["Own_Warehouse_Consumed"] = own_consumed
+    driver["Shortage"] = shortage
+    driver["Shortage_After_Transfer"] = shortage.copy()
+    driver["Warehouse_Consumption_Total"] = own_consumed.copy()
+    driver["Family_Shortage_Received"] = 0.0
+    driver["Family_Shortage_Transferred"] = 0.0
+    driver["Family_Transfer_From"] = ""
+    driver["Family_Transfer_To"] = ""
+    if "Warehouse_Covered" not in driver.columns:
+        driver["Warehouse_Covered"] = 0.0
+
+    average = (
+        pd.to_numeric(
+            driver.get("Export_Average", pd.Series(0.0, index=driver.index)),
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .astype("float64")
+    )
+    branch = (
+        pd.to_numeric(
+            driver.get("Branch_Stock", pd.Series(0.0, index=driver.index)),
+            errors="coerce",
+        )
+        .fillna(0.0)
+        .astype("float64")
+    )
+
+    aggregated_rows = 0
+    key_series = pd.Series(keys, index=driver.index, dtype="object")
+    for _, key_rows in key_series.groupby(key_series, sort=False):
+        group = list(key_rows.index)
+        if len(group) < 2:
+            continue
+        if bool(protected_mask.loc[group].any()):
+            # A forced distribution or an official substitute already has an
+            # explicit instruction.  It stays outside this transfer step.
+            continue
+        group_codes = [
+            "" if pd.isna(codes.loc[idx]) else str(codes.loc[idx]).strip()
+            for idx in group
+        ]
+        if any(not code for code in group_codes):
+            continue
+
+        driver.loc[group, "Family_Aggregated"] = True
+        driver.loc[group, "Family_Aggregation_Status"] = "transfer"
+        driver.loc[group, "Family_Covered_Out"] = False
+        driver.loc[group, "Family_Covered_By"] = ""
+        driver.loc[group, "Family_Coverage_Amount"] = 0.0
+        driver.loc[group, "Family_Coverage_Kind"] = ""
+        driver.loc[group, "Family_Ordered_Out"] = False
+        driver.loc[group, "Shared_Name_Note"] = ""
+        driver.loc[group, "Shared_Covered_Out"] = False
+        driver.loc[group, "Sibling_Transfer_Out"] = False
+        driver.loc[group, "Shared_Name_Adjustment"] = 0.0
+        driver.loc[group, "Different_Size_Covered_By"] = ""
+        driver.loc[group, "Different_Size_Coverage_Amount"] = 0.0
+        driver.loc[group, "Different_Size_Covered_Out"] = False
+        driver.loc[group, "Warehouse_Covered"] = own_consumed.loc[group]
+        driver.loc[group, "Final_Purchase_Order"] = 0.0
+        driver.loc[group, "Family_Target_Total"] = float(
+            calculated.loc[group].sum()
+        )
+        driver.loc[group, "Family_Stock_Total"] = float(
+            warehouse.loc[group].sum()
+        )
+        driver.loc[group, "Family_Net_Need"] = float(
+            shortage.loc[group].sum()
+        )
+        driver.loc[group, "Family_Group_Size"] = len(group)
+        driver.loc[group, "Family_Average_Sum"] = float(
+            average.loc[group].sum()
+        )
+        driver.loc[group, "Family_Calculated_Sum"] = float(
+            calculated.loc[group].sum()
+        )
+        driver.loc[group, "Family_Branch_Stock"] = float(
+            branch.loc[group].sum()
+        )
+        driver.loc[group, "Family_Warehouse_Stock"] = float(
+            warehouse.loc[group].sum()
+        )
+
+        group_available = {
+            idx: float(available.loc[idx]) for idx in group
+        }
+        received: dict[object, float] = {idx: 0.0 for idx in group}
+        transferred_out: dict[object, float] = {idx: 0.0 for idx in group}
+        received_from: dict[object, list[tuple[str, float, float, float]]] = {
+            idx: [] for idx in group
+        }
+
+        for source in group:
+            need = float(shortage.loc[source])
+            if need <= 1e-9:
+                continue
+            source_code = str(codes.loc[source]).strip()
+            transferred = 0.0
+            targets: list[tuple[object, str, float]] = []
+            while need > 1e-9:
+                candidates = [
+                    candidate
+                    for candidate in group
+                    if candidate != source
+                    and float(group_available[candidate]) > 1e-9
+                ]
+                if not candidates:
+                    break
+                target = max(
+                    candidates,
+                    key=lambda candidate: (
+                        float(group_available[candidate]),
+                        str(codes.loc[candidate]),
+                    ),
+                )
+                target_code = str(codes.loc[target]).strip()
+                quantity = min(need, float(group_available[target]))
+                if quantity <= 1e-9:
+                    break
+                group_available[target] = max(
+                    0.0, float(group_available[target]) - quantity
+                )
+                need -= quantity
+                transferred += quantity
+                targets.append((target, target_code, quantity))
+                received[target] += quantity
+                received_from[target].append(
+                    (
+                        source_code,
+                        quantity,
+                        float(own_consumed.loc[source]),
+                        float(shortage.loc[source]),
+                    )
+                )
+
+            if transferred > 1e-9:
+                target_codes = list(
+                    dict.fromkeys(
+                        target_code for _, target_code, _ in targets
+                    )
+                )
+                if len(target_codes) == 1:
+                    target_text = f"للكارتة {target_codes[0]}"
+                else:
+                    target_text = "للكارتات " + " و ".join(target_codes)
+                source_own = float(own_consumed.loc[source])
+                if source_own <= 1e-9:
+                    note = (
+                        f"تحويل كامل الطلب ({transferred:g}) "
+                        f"{target_text}."
+                    )
+                else:
+                    note = (
+                        f"تم سحب {source_own:g} من المخزن، "
+                        f"وتحويل نقص {transferred:g} {target_text}."
+                    )
+                if need > 1e-9:
+                    note = f"{note} | متبقي {need:g}"
+                driver.at[source, "ملاحظات"] = note
+                driver.at[source, "Family_Shortage_Transferred"] = (
+                    transferred
+                )
+                transferred_out[source] = transferred
+                driver.at[source, "Family_Transfer_To"] = ", ".join(
+                    target_codes
+                )
+            elif float(shortage.loc[source]) > 1e-9:
+                driver.at[source, "ملاحظات"] = (
+                    "لا يوجد رصيد بالمخزن أو الكارتات البديلة."
+                )
+
+            driver.at[source, "Shortage_After_Transfer"] = max(
+                0.0, float(shortage.loc[source]) - transferred
+            )
+
+        for idx in group:
+            quantity_received = float(received[idx])
+            quantity_transferred = float(transferred_out[idx])
+            warehouse_covered = min(
+                float(calculated.loc[idx]) + quantity_received,
+                float(warehouse.loc[idx]),
+            )
+            adjustment = quantity_received - quantity_transferred
+            final_quantity = max(
+                0.0,
+                float(calculated.loc[idx])
+                - warehouse_covered
+                + adjustment,
+            )
+
+            driver.at[idx, "Warehouse_Covered"] = warehouse_covered
+            driver.at[idx, "Warehouse_Consumption_Total"] = warehouse_covered
+            driver.at[idx, "Shared_Name_Adjustment"] = adjustment
+            driver.at[idx, "Final_Purchase_Order"] = final_quantity
+            driver.at[idx, "Shortage_After_Transfer"] = final_quantity
+            driver.at[idx, "Warehouse_Loading"] = warehouse_covered > 1e-9
+
+            if quantity_received > 1e-9:
+                driver.at[idx, "Family_Shortage_Received"] = (
+                    quantity_received
+                )
+                sources = received_from[idx]
+                if len(sources) == 1:
+                    source_code, quantity, source_own, _ = sources[0]
+                    if source_own > 1e-9:
+                        note = (
+                            f"تم استلام {quantity:g} من الكارتة "
+                            f"{source_code}، وإجمالي المسحوب من المخزن "
+                            f"{warehouse_covered:g}."
+                        )
+                    else:
+                        note = (
+                            f"تم استلام {quantity:g} من الكارتة "
+                            f"{source_code}، وإجمالي المسحوب "
+                            f"{warehouse_covered:g}."
+                        )
+                else:
+                    source_codes = " و ".join(
+                        dict.fromkeys(
+                            source_code for source_code, _, _, _ in sources
+                        )
+                    )
+                    note = (
+                        f"تم استلام {quantity_received:g} من كارتات "
+                        f"{source_codes}، وإجمالي المسحوب "
+                        f"{warehouse_covered:g}."
+                    )
+                driver.at[idx, "ملاحظات"] = note
+                driver.at[idx, "Family_Transfer_From"] = ", ".join(
+                    dict.fromkeys(
+                        source_code for source_code, _, _, _ in sources
+                    )
+                )
+            elif (
+                quantity_transferred <= 1e-9
+                and float(shortage.loc[idx]) <= 1e-9
+                and float(calculated.loc[idx]) > 1e-9
+            ):
+                # No own shortage and no incoming transfer: the card's own
+                # warehouse covered its independent requirement.
+                driver.at[idx, "ملاحظات"] = "مغطى بالكامل من المخزن."
+
+        aggregated_rows += len(group)
+
+    return int(aggregated_rows)
+
+
+def _apply_family_warehouse_coverage(
+    driver: pd.DataFrame,
+    multi_price: pd.DataFrame | None,
+) -> float:
+    """Cover remaining demand from the item's product family.
+
+    This is the warehouse part of the Ultimate Waterfall.  Own-card warehouse
+    stock has already been applied by :func:`_apply_substitute_waterfall`, and
+    branch pooling has already run in :func:`_apply_shared_name_coverage`.
+    This pass therefore starts from the exact remaining ``Final_Purchase_Order``
+    and uses, in strict order:
+
+    1. an exact same-size/same-name card in the multi-price sheet;
+    2. an exact same-size/same-name card in the general warehouse;
+    3. an old-price/inactive card with the same exact name, from either source;
+    4. a different-size card with the same :func:`_base_name`, but only when no
+       exact-size card (own, multi-price or general) carries warehouse stock.
+
+    A covered line gets the buyer-facing notes
+    ``تم تغطية الطلب من بديل: CODE`` on the original card and
+    ``طلب بديل للصنف SOURCE_CODE`` on the substitute card.  No purchase line is
+    created for covered stock.  A partially covered line keeps only the
+    uncovered remainder and records the same coverage note.
+    """
+    required = {
+        "الكود",
+        "اسم الصنف",
+        "Final_Purchase_Order",
+        "Warehouse_Stock",
+    }
+    if driver is None or driver.empty or not required.issubset(driver.columns):
+        return 0.0
+    if "Warehouse_Covered" not in driver.columns:
+        driver["Warehouse_Covered"] = 0.0
+    if "Shared_Name_Adjustment" not in driver.columns:
+        driver["Shared_Name_Adjustment"] = 0.0
+
+    codes = _clean_code_series(driver["الكود"])
+    names = driver["اسم الصنف"].astype("string").fillna("")
+    normalised = names.map(_normalise_group_name)
+    identities = normalised.map(_group_identity)
+    bases = normalised.map(_base_name)
+    hash_flags = normalised.map(
+        lambda value: bool(_HASH_SIZE_RE.search(str(value)))
+    )
+
+    def _old_or_inactive(value: object) -> bool:
+        text = normalize_arabic_text(value).upper()
+        return bool(
+            _OLD_PRICE_MARKER_RE.search(text)
+            or _INACTIVE_MARKER_RE.search(text)
+        )
+
+    old_flags = names.map(_old_or_inactive)
+    family_aggregated = (
+        driver.get("Family_Aggregated", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    warehouse = (
+        pd.to_numeric(driver["Warehouse_Stock"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    already_covered = (
+        pd.to_numeric(driver["Warehouse_Covered"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    available = (warehouse - already_covered).clip(lower=0.0)
+    final = (
+        pd.to_numeric(driver["Final_Purchase_Order"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+        .astype("float64")
+    )
+
+    code_to_index: dict[str, object] = {}
+    for idx, code in codes.items():
+        if pd.isna(code):
+            continue
+        cleaned = str(code).strip()
+        if cleaned and cleaned not in code_to_index:
+            code_to_index[cleaned] = idx
+
+    multi_by_code: dict[str, tuple[str, str, str, bool]] = {}
+    multi_codes: set[str] = set()
+    if multi_price is not None and not getattr(multi_price, "empty", True):
+        multi_code_column = _code_column(multi_price, _CODE_COLUMN_ALIASES)
+        multi_name_column = next(
+            (
+                column
+                for column in ("اسم الصنف", "الاسم", "Item Name")
+                if column in multi_price.columns
+            ),
+            None,
+        )
+        if multi_code_column is not None and multi_name_column is not None:
+            for raw_code, raw_name in multi_price.loc[
+                :, [multi_code_column, multi_name_column]
+            ].itertuples(index=False, name=None):
+                cleaned_code = clean_sku(raw_code)
+                if pd.isna(cleaned_code):
+                    continue
+                code = str(cleaned_code).strip()
+                if not code:
+                    continue
+                multi_codes.add(code)
+                if code in multi_by_code:
+                    continue
+                norm = _normalise_group_name(raw_name)
+                if not norm:
+                    continue
+                multi_by_code[code] = (
+                    _group_identity(norm),
+                    _base_name(norm),
+                    norm,
+                    _old_or_inactive(raw_name),
+                )
+
+    # Build the family indexes once.  The previous candidate scan repeated a
+    # full driver/multi-price walk for every ordered row, which is far too slow
+    # for a 60k-row catalogue.
+    driver_by_identity: dict[str, list[object]] = {}
+    driver_by_base: dict[str, list[object]] = {}
+    for idx in driver.index:
+        if bool(family_aggregated.loc[idx]):
+            # A Rule-1 family has already pooled its warehouse balance.  It
+            # must not donate that same stock again to another row.
+            continue
+        identity = str(identities.loc[idx])
+        base_name = str(bases.loc[idx])
+        if identity:
+            driver_by_identity.setdefault(identity, []).append(idx)
+        if base_name:
+            driver_by_base.setdefault(base_name, []).append(idx)
+
+    multi_exact_by_identity: dict[str, list[object]] = {}
+    multi_old_by_identity: dict[str, list[object]] = {}
+    multi_by_base: dict[str, list[tuple[object, str]]] = {}
+    for code, (multi_identity, multi_base, _, is_old) in multi_by_code.items():
+        target_idx = code_to_index.get(code)
+        if target_idx is None or bool(family_aggregated.loc[target_idx]):
+            continue
+        if is_old:
+            multi_old_by_identity.setdefault(multi_identity, []).append(target_idx)
+        else:
+            multi_exact_by_identity.setdefault(multi_identity, []).append(target_idx)
+        if multi_base:
+            multi_by_base.setdefault(multi_base, []).append(
+                (target_idx, multi_identity)
+            )
+
+    if "Substitutes" not in driver.columns:
+        driver["Substitutes"] = 0.0
+    if "Family_Covered_Out" not in driver.columns:
+        driver["Family_Covered_Out"] = False
+    if "Family_Covered_By" not in driver.columns:
+        driver["Family_Covered_By"] = ""
+    if "Family_Coverage_Amount" not in driver.columns:
+        driver["Family_Coverage_Amount"] = 0.0
+    if "Family_Coverage_Kind" not in driver.columns:
+        driver["Family_Coverage_Kind"] = ""
+    driver.loc[~family_aggregated, "Family_Covered_Out"] = False
+    driver.loc[~family_aggregated, "Family_Covered_By"] = ""
+    driver.loc[~family_aggregated, "Family_Coverage_Amount"] = 0.0
+    driver.loc[~family_aggregated, "Family_Coverage_Kind"] = ""
+
+    family_out = pd.Series(False, index=driver.index, dtype=bool)
+    total_adjustment = 0.0
+
+    def _pick_candidate(
+        candidates: list[object],
+        need: float,
+    ) -> object | None:
+        pool = [
+            candidate
+            for candidate in candidates
+            if float(available.loc[candidate]) > 0.0
+        ]
+        if not pool:
+            return None
+        full = [
+            candidate
+            for candidate in pool
+            if float(available.loc[candidate]) + 1e-9 >= need
+        ]
+        return max(
+            full or pool,
+            key=lambda candidate: (
+                float(available.loc[candidate]),
+                str(codes.loc[candidate]),
+            ),
+        )
+
+    for idx in driver.index:
+        if bool(family_aggregated.loc[idx]):
+            # Rule 1 already pooled exact-family stock and demand.  Only the
+            # separate last-resort pass may touch these rows from here.
+            continue
+        need = float(final.loc[idx])
+        if need <= 0.0:
+            continue
+
+        identity = str(identities.loc[idx])
+        base_name = str(bases.loc[idx])
+        if not identity and not base_name:
+            continue
+        source_hash = bool(hash_flags.loc[idx])
+
+        def _same_hash(candidate: object) -> bool:
+            return bool(hash_flags.loc[candidate]) == source_hash
+
+        exact_multi = [
+            candidate
+            for candidate in multi_exact_by_identity.get(identity, [])
+            if candidate != idx and _same_hash(candidate)
+        ]
+        old_multi = [
+            candidate
+            for candidate in multi_old_by_identity.get(identity, [])
+            if candidate != idx and _same_hash(candidate)
+        ]
+        different_multi = [
+            candidate
+            for candidate, multi_identity in multi_by_base.get(base_name, [])
+            if candidate != idx
+            and (multi_identity != identity or not _same_hash(candidate))
+        ]
+
+        general_exact_active: list[object] = []
+        general_old: list[object] = []
+        general_different: list[object] = []
+        for candidate in driver_by_identity.get(identity, []):
+            if candidate == idx:
+                continue
+            candidate_code = (
+                "" if pd.isna(codes.loc[candidate]) else str(codes.loc[candidate]).strip()
+            )
+            if candidate_code and candidate_code in multi_codes:
+                continue
+            if not _same_hash(candidate):
+                general_different.append(candidate)
+            elif bool(old_flags.loc[candidate]):
+                general_old.append(candidate)
+            else:
+                general_exact_active.append(candidate)
+        if base_name:
+            for candidate in driver_by_base.get(base_name, []):
+                if candidate == idx:
+                    continue
+                if (
+                    str(identities.loc[candidate]) == identity
+                    and _same_hash(candidate)
+                ):
+                    continue
+                candidate_code = (
+                    "" if pd.isna(codes.loc[candidate]) else str(codes.loc[candidate]).strip()
+                )
+                if candidate_code and candidate_code in multi_codes:
+                    continue
+                general_different.append(candidate)
+
+        old_candidates = list(
+            dict.fromkeys([*old_multi, *general_old])
+        )
+        different_candidates = list(
+            dict.fromkeys([*different_multi, *general_different])
+        )
+
+        # Different size is the absolute last resort.  If any exact-size card
+        # (own, multi-price or general warehouse) carries stock, the remainder
+        # is bought on the original line rather than borrowed from another
+        # size.
+        exact_size_found = (
+            float(warehouse.loc[idx]) > 0.0
+            or any(
+                float(warehouse.loc[candidate]) > 0.0
+                for candidate in [
+                    *exact_multi,
+                    *general_exact_active,
+                    *old_candidates,
+                ]
+            )
+        )
+
+        priority_groups: list[tuple[list[object], str]] = [
+            (exact_multi, "same"),
+            (general_exact_active, "same"),
+            (old_candidates, "same"),
+        ]
+        if not exact_size_found:
+            priority_groups.append((different_candidates, "different"))
+
+        covered_now = 0.0
+        covered_codes: list[tuple[str, str, object]] = []
+        for candidates, kind in priority_groups:
+            while need > 0.0:
+                target_idx = _pick_candidate(candidates, need)
+                if target_idx is None:
+                    break
+                target_code = (
+                    "" if pd.isna(codes.loc[target_idx]) else str(codes.loc[target_idx]).strip()
+                )
+                if not target_code:
+                    available.loc[target_idx] = 0.0
+                    continue
+                quantity = min(
+                    need, float(available.loc[target_idx])
+                )
+                if quantity <= 0.0:
+                    break
+                available.loc[target_idx] = max(
+                    0.0, float(available.loc[target_idx]) - quantity
+                )
+                need -= quantity
+                covered_now += quantity
+                covered_codes.append((target_code, kind, target_idx))
+
+        if covered_now <= 0.0:
+            continue
+
+        final.loc[idx] = need
+        driver.at[idx, "Final_Purchase_Order"] = need
+        driver.at[idx, "Substitutes"] = (
+            _as_float(driver.at[idx, "Substitutes"]) + covered_now
+        )
+        driver.at[idx, "Shared_Name_Adjustment"] = (
+            _as_float(driver.at[idx, "Shared_Name_Adjustment"]) - covered_now
+        )
+        source_code = "" if pd.isna(codes.loc[idx]) else str(codes.loc[idx]).strip()
+        driver.at[idx, "Family_Covered_By"] = ", ".join(
+            code for code, _, _ in covered_codes
+        )
+        driver.at[idx, "Family_Coverage_Amount"] = covered_now
+        driver.at[idx, "Family_Coverage_Kind"] = covered_codes[-1][1]
+        if need <= 1e-9:
+            family_out.loc[idx] = True
+            driver.at[idx, "Family_Covered_Out"] = True
+
+        different_codes = list(
+            dict.fromkeys(
+                code
+                for code, kind, _ in covered_codes
+                if kind == "different"
+            )
+        )
+        if different_codes:
+            # Rule 2 has its own exact buyer-facing wording.  It is never
+            # mixed with the same-size substitute note, so a different size is
+            # visibly the last resort it is meant to be.
+            source_note = (
+                "مغطى من نفس الصنف (حجم مختلف: "
+                + ", ".join(different_codes)
+                + ")"
+            )
+        else:
+            source_note = " | ".join(
+                dict.fromkeys(
+                    f"تم تغطية الطلب من بديل: {code}"
+                    for code, _, _ in covered_codes
+                )
+            )
+        if need > 1e-9:
+            source_note = f"{source_note} | متبقي {need:g}"
+        driver.at[idx, "ملاحظات"] = source_note
+        for _, _, target_idx in covered_codes:
+            driver.at[target_idx, "ملاحظات"] = (
+                f"طلب بديل للصنف {source_code}"
+            )
+        total_adjustment -= covered_now
+
+    return float(total_adjustment)
+
+
+_OLD_PRICE_RE = re.compile(r"س\s*\.?\s*ق", re.IGNORECASE)
+
+
+def _apply_sibling_order_transfer(
+    driver: pd.DataFrame,
+    multi_price: pd.DataFrame | None,
+) -> float:
+    """Move a purchase line to its exact sibling card when required.
+
+    Two business rules share the same transfer mechanism:
+
+    * a card whose name carries the old-price marker ``س.ق`` always hands its
+      purchase quantity to its exact sibling **without** that marker;
+    * a multi-price card with no warehouse balance of its own hands its
+      purchase quantity to the sibling card listed by the multi-price sheet.
+
+    The destination line receives the quantity, the source line is left at
+    zero.  The source note is
+    ``تم تغطية الطلب من بديل: CODE`` and the substitute card note is
+    ``طلب بديل للصنف SOURCE_CODE``.  ``Shared_Name_Adjustment`` is shifted row
+    by row so the FAIL-FAST identity continues to reconcile to the same total.
+    """
+    required = {
+        "الكود",
+        "اسم الصنف",
+        "Final_Purchase_Order",
+        "Warehouse_Stock",
+    }
+    if driver is None or driver.empty or not required.issubset(driver.columns):
+        return 0.0
+
+    codes = _clean_code_series(driver["الكود"])
+    code_to_index: dict[str, object] = {}
+    for idx, code in codes.items():
+        if pd.isna(code):
+            continue
+        cleaned = str(code).strip()
+        if cleaned and cleaned not in code_to_index:
+            code_to_index[cleaned] = idx
+
+    names = driver["اسم الصنف"].astype("string").fillna("")
+    old_price = names.map(lambda value: bool(_OLD_PRICE_RE.search(str(value))))
+    final_before = pd.to_numeric(
+        driver["Final_Purchase_Order"], errors="coerce"
+    ).fillna(0.0)
+    warehouse = (
+        pd.to_numeric(driver["Warehouse_Stock"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0)
+    )
+    prices = pd.to_numeric(
+        driver.get("Price", pd.Series(0.0, index=driver.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    substituted = (
+        driver.get("Substituted_Out", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+    family_aggregated = (
+        driver.get("Family_Aggregated", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
+
+    groups, _ = _build_name_groups(names)
+    group_for_index: dict[object, list[object]] = {}
+    for group in groups:
+        for idx in group:
+            group_for_index[idx] = group
+
+    multi_siblings = _multi_price_sibling_codes(multi_price, driver)
+    if "Shared_Name_Adjustment" not in driver.columns:
+        driver["Shared_Name_Adjustment"] = 0.0
+    if "Sibling_Transfer_Out" not in driver.columns:
+        driver["Sibling_Transfer_Out"] = False
+
+    transferred = 0.0
+    transferred_sources: set[object] = set()
+    transferred_targets: set[object] = set()
+    for idx in driver.index:
+        quantity = float(final_before.loc[idx])
+        if (
+            quantity <= 0
+            or bool(substituted.loc[idx])
+            or bool(family_aggregated.loc[idx])
+            or idx in transferred_targets
+        ):
+            continue
+
+        own_code = "" if pd.isna(codes.loc[idx]) else str(codes.loc[idx]).strip()
+        candidates: list[object] = []
+
+        if bool(old_price.loc[idx]):
+            # Task 5: the old-price card is grouped with its exact sibling.
+            candidates = [
+                candidate
+                for candidate in group_for_index.get(idx, [])
+                if candidate != idx
+                and candidate not in transferred_sources
+                and not bool(old_price.loc[candidate])
+                and not bool(substituted.loc[candidate])
+                and not bool(family_aggregated.loc[candidate])
+            ]
+        elif float(warehouse.loc[idx]) <= 0.0:
+            # Task 6: no own warehouse balance -> use the multi-price sibling.
+            for sibling in multi_siblings.get(idx, ()):
+                target_idx = code_to_index.get(str(sibling).strip())
+                if (
+                    target_idx is not None
+                    and target_idx != idx
+                    and target_idx not in transferred_sources
+                    and not bool(old_price.loc[target_idx])
+                    and not bool(substituted.loc[target_idx])
+                    and not bool(family_aggregated.loc[target_idx])
+                ):
+                    candidates.append(target_idx)
+
+        if not candidates:
+            continue
+
+        if bool(old_price.loc[idx]):
+            # The new-price card is the exact non-suffixed sibling.  If several
+            # cards share the identity, the highest current price is the most
+            # likely active replacement; the code keeps the choice stable.
+            target = max(
+                candidates,
+                key=lambda candidate: (
+                    float(prices.loc[candidate]),
+                    str(codes.loc[candidate]),
+                ),
+            )
+        else:
+            # Prefer the sibling that can actually provide stock, then price.
+            target = max(
+                candidates,
+                key=lambda candidate: (
+                    float(warehouse.loc[candidate]),
+                    float(prices.loc[candidate]),
+                    str(codes.loc[candidate]),
+                ),
+            )
+
+        target_code = "" if pd.isna(codes.loc[target]) else str(codes.loc[target])
+        if not target_code:
+            continue
+        transferred_sources.add(idx)
+        transferred_targets.add(target)
+
+        driver.at[target, "Final_Purchase_Order"] = (
+            _as_float(driver.at[target, "Final_Purchase_Order"]) + quantity
+        )
+        driver.at[idx, "Final_Purchase_Order"] = 0.0
+
+        note = f"تم تغطية الطلب من بديل: {target_code}"
+        driver.at[idx, "ملاحظات"] = note
+        driver.at[idx, "Sibling_Transfer_Out"] = True
+        # The substitute card receives the clear buyer-facing note.  It is
+        # written unconditionally so an existing card note cannot hide why the
+        # order arrived there.
+        driver.at[target, "ملاحظات"] = f"طلب بديل للصنف {own_code}"
+
+        old_adjustment = _as_float(
+            driver.at[idx, "Shared_Name_Adjustment"]
+        )
+        target_adjustment = _as_float(
+            driver.at[target, "Shared_Name_Adjustment"]
+        )
+        driver.at[idx, "Shared_Name_Adjustment"] = old_adjustment - quantity
+        driver.at[target, "Shared_Name_Adjustment"] = (
+            target_adjustment + quantity
+        )
+        transferred += quantity
+
+    return transferred
 
 
 def _multi_price_sibling_codes(
@@ -3147,37 +4303,46 @@ def _apply_substitute_waterfall(
     allocate_warehouse: bool,
     enabled: bool,
 ) -> pd.DataFrame:
-    """Deduct demand from the item, then its siblings, then its substitute.
+    """Deduct demand from the item's own warehouse first.
 
-    The priority is exact:
+    The full priority queue continues in
+    :func:`_apply_family_warehouse_coverage` after branch pooling:
 
-    1. the main item's own ``Warehouse_Stock``;
-    2. a sibling card with the same name in the multi-price sheet;
-    3. the official master substitute;
-    4. the remaining quantity stays in ``Final_Purchase_Order``.
+    1. the main item's own ``Warehouse_Stock`` (this function);
+    2. an exact same-size/same-name card in the multi-price sheet;
+    3. an exact same-size/same-name card in the general warehouse;
+    4. an old-price/inactive exact sibling;
+    5. a different-size card with the same base name, only when no exact-size
+       card has warehouse stock.
 
-    ``Substitutes`` records only the quantity actually covered by steps 2 and
-    3.  The chosen substitute is written as a separate purchase line by
-    :func:`_build_substitute_rows`; the original line is kept at zero so both
-    sides of the replacement are visible.
+    Keeping this pass limited to own stock is intentional: a sibling's
+    warehouse balance must set ``Final_Purchase_Order`` to zero and produce a
+    coverage note, never a separate purchase substitute line.
     """
     calculated = pd.to_numeric(
         driver.get("Calculated_Order"), errors="coerce"
     ).fillna(0.0).clip(lower=0.0)
-    warehouse = np.floor(
+    # Fractional warehouse balances are real.  Only the final purchase order
+    # is rounded up, never the stock used to cover it.
+    warehouse = (
         pd.to_numeric(driver.get("Warehouse_Stock"), errors="coerce")
         .fillna(0.0)
         .clip(lower=0.0)
     )
 
+    family_aggregated = (
+        driver.get("Family_Aggregated", pd.Series(False, index=driver.index))
+        .fillna(False)
+        .astype(bool)
+    )
     if allocate_warehouse:
         warehouse_covered = np.minimum(warehouse, calculated)
     else:
         warehouse_covered = pd.Series(0.0, index=driver.index, dtype="float64")
+    # Rule 1 already pooled the family warehouse balance into the family net
+    # need.  Deducting own stock again here would double-count it.
+    warehouse_covered = warehouse_covered.mask(family_aggregated, 0.0)
 
-    # Stock left after every card has first served its own demand.  This is
-    # what a sibling may lend to another card.
-    available = (warehouse - warehouse_covered).clip(lower=0.0)
     remaining = (calculated - warehouse_covered).clip(lower=0.0)
 
     driver["Warehouse_Covered"] = warehouse_covered.astype("float64")
@@ -3191,119 +4356,12 @@ def _apply_substitute_waterfall(
     if not enabled or not allocate_warehouse:
         return driver
 
-    codes = _clean_code_series(driver["الكود"])
-    code_to_index: dict[str, object] = {}
-    for idx, code in codes.items():
-        if pd.isna(code):
-            continue
-        cleaned = str(code).strip()
-        if cleaned and cleaned not in code_to_index:
-            code_to_index[cleaned] = idx
-
-    siblings = _multi_price_sibling_codes(multi_price, driver)
-    official_codes = (
-        driver["Substitute_Code"].astype("string").fillna("").str.strip()
-    )
-    official_names = driver["Substitute_Name"].astype("string").fillna("")
-
-    for idx in driver.index:
-        need = float(remaining.loc[idx])
-        if need <= 0:
-            continue
-
-        own_code = "" if pd.isna(codes.loc[idx]) else str(codes.loc[idx]).strip()
-
-        multi_candidates: list[tuple[str, float, object]] = []
-        for code in siblings.get(idx, ()):
-            if not code or code == own_code:
-                continue
-            target_idx = code_to_index.get(code)
-            if target_idx is None:
-                continue
-            quantity = float(available.loc[target_idx])
-            if quantity > 0:
-                multi_candidates.append((code, quantity, target_idx))
-
-        official_candidates: list[tuple[str, float, object]] = []
-        official_code = str(official_codes.loc[idx]).strip()
-        if official_code and official_code != own_code:
-            target_idx = code_to_index.get(official_code)
-            if target_idx is not None:
-                quantity = float(available.loc[target_idx])
-                if quantity > 0:
-                    official_candidates.append(
-                        (official_code, quantity, target_idx)
-                    )
-
-        def _full_or_largest(
-            candidates: list[tuple[str, float, object]]
-        ) -> tuple[str, float, object] | None:
-            if not candidates:
-                return None
-            full = [
-                candidate
-                for candidate in candidates
-                if candidate[1] + 1e-9 >= need
-            ]
-            pool = full or candidates
-            return max(pool, key=lambda candidate: (candidate[1], candidate[2]))
-
-        chosen: tuple[str, float, object] | None = None
-        source = ""
-        multi_full = [
-            candidate
-            for candidate in multi_candidates
-            if candidate[1] + 1e-9 >= need
-        ]
-        if multi_full:
-            chosen = max(
-                multi_full, key=lambda candidate: (candidate[1], candidate[2])
-            )
-            source = "multi_price"
-        else:
-            official_full = [
-                candidate
-                for candidate in official_candidates
-                if candidate[1] + 1e-9 >= need
-            ]
-            if official_full:
-                chosen = max(
-                    official_full,
-                    key=lambda candidate: (candidate[1], candidate[2]),
-                )
-                source = "master"
-            elif multi_candidates:
-                chosen = _full_or_largest(multi_candidates)
-                source = "multi_price"
-            elif official_candidates:
-                chosen = _full_or_largest(official_candidates)
-                source = "master"
-
-        if chosen is None:
-            continue
-
-        substitute_code, substitute_available, target_idx = chosen
-        deduction = min(need, float(substitute_available))
-        if deduction <= 0:
-            continue
-
-        driver.at[idx, "Substitute_Code"] = substitute_code
-        driver.at[idx, "Substitute_Name"] = _clean_text(
-            driver.at[target_idx, "اسم الصنف"]
-        )
-        driver.at[idx, "Substitute_Source"] = source
-        driver.at[idx, "Substitutes"] = float(deduction)
-        driver.at[idx, "Substitute_Request"] = need
-        driver.at[idx, "Substituted_Out"] = True
-        driver.at[idx, "Final_Purchase_Order"] = 0.0
-
-        available.loc[target_idx] = max(
-            0.0, float(available.loc[target_idx]) - float(deduction)
-        )
-        driver.at[target_idx, "Transferred_In"] = (
-            float(driver.at[target_idx, "Transferred_In"]) + float(deduction)
-        )
-
+    # Sibling, old-price, different-size and general-warehouse coverage is
+    # applied later by :func:`_apply_family_warehouse_coverage`, after exact
+    # name pooling.  Keeping this pass limited to the item's own warehouse
+    # prevents a sibling's stock from being turned into a *purchase* line:
+    # the Golden Coverage Rule requires Final_Purchase_Order = 0 and a
+    # coverage note instead.
     return driver
 
 
@@ -3458,6 +4516,107 @@ def _build_substitute_rows(
     return pd.DataFrame(rows, columns=columns), cost
 
 
+def _extract_coverage_code(row: pd.Series | dict[str, object]) -> str:
+    """Return the sibling/card code behind a coverage note, if any."""
+    family_code = _clean_text(row.get("Family_Covered_By"))
+    if family_code:
+        return family_code.split(",")[0].strip()
+
+    notes = _clean_text(row.get("ملاحظات"))
+    if notes:
+        match = re.search(
+            r"(?:كارتة|للكارتة|بالصنف)\s*:?\s*([A-Za-z0-9\u0600-\u06FF_-]+)"
+            r"|بديل(?!\s+للصنف)\s*:\s*([A-Za-z0-9\u0600-\u06FF_-]+)",
+            notes,
+        )
+        if match:
+            value = match.group(1) or match.group(2) or ""
+            return value.strip(" :،,.")
+
+    substitute_code = _clean_text(row.get("Substitute_Code"))
+    if substitute_code:
+        return substitute_code
+    return ""
+
+
+def _arabic_missing_reason(
+    row: pd.Series | dict[str, object],
+    english_reason: str,
+) -> str:
+    """Translate the diagnostic reason into the buyer's Arabic wording."""
+    notes = _clean_text(row.get("ملاحظات"))
+
+    def _flag(name: str) -> bool:
+        value = row.get(name, False)
+        try:
+            return False if pd.isna(value) else bool(value)
+        except (TypeError, ValueError):
+            return bool(value)
+
+    different_size_code = _clean_text(
+        row.get("Different_Size_Covered_By")
+    )
+    if different_size_code:
+        return (
+            "مغطى من نفس الصنف (حجم مختلف: "
+            f"{different_size_code})"
+        )
+
+    family_aggregated = _flag("Family_Aggregated")
+    family_status = _clean_text(row.get("Family_Aggregation_Status"))
+    if family_aggregated:
+        if family_status == "transfer":
+            if any("\u0600" <= char <= "\u06ff" for char in notes):
+                return notes
+            return "تم توزيع النقص على كارتة بديلة"
+        if family_status == "stagnant":
+            return "صنف راكد (لا يوجد مبيعات)"
+        if family_status == "covered":
+            family_target = _as_float(row.get("Family_Target_Total"))
+            if family_target <= 0.0:
+                return "صنف راكد (لا يوجد مبيعات)"
+            return "مغطى من إجمالي رصيد العائلة"
+        if family_status == "ordered":
+            required = _as_float(row.get("Final_Purchase_Order"))
+            if required <= 0.0:
+                primary_code = _clean_text(row.get("Family_Primary_Code"))
+                if primary_code:
+                    return (
+                        "طلب مجمع للعائلة (كارتة: "
+                        f"{primary_code})"
+                    )
+                return "طلب مجمع للعائلة"
+
+    family_covered = _flag("Family_Covered_Out")
+    sibling_out = _flag("Sibling_Transfer_Out")
+    substituted = _flag("Substituted_Out")
+    coverage_code = _extract_coverage_code(row)
+    if coverage_code and (
+        family_covered
+        or sibling_out
+        or substituted
+        or "مغطى" in notes
+        or "تم النقل" in notes
+        or "استبداله" in notes
+        or "تم تغطية الطلب" in notes
+    ):
+        return f"مغطى من بديل (كارتة: {coverage_code})"
+
+    if english_reason in {"Zero Sales", "Stagnant / No Sales"}:
+        return "صنف راكد (لا يوجد مبيعات)"
+    if english_reason == "Sufficient Stock":
+        return "رصيد الفرع كافي"
+    if english_reason == "Above ROP":
+        return "أعلى من نقطة إعادة الطلب"
+    if english_reason == "Filtered by scope":
+        return "مستبعد من نطاق الطلب"
+    if english_reason in {"Not in master catalogue", "No data"}:
+        return "غير متوفر بالبيانات"
+    if english_reason == "Not Required":
+        return "غير مطلوب"
+    return "غير مطلوب"
+
+
 def _build_missing_items_report(
     driver: pd.DataFrame,
     final: pd.DataFrame,
@@ -3470,24 +4629,25 @@ def _build_missing_items_report(
     was covered by stock, ignored for zero sales, outside the catalogue, or
     simply not required.
     """
-    report_columns = [
-        "Item_Code",
-        "Item_Name",
-        "Source",
-        "Reason",
-        "Branch_Stock",
-        "Warehouse_Stock",
-        "Effective_Stock",
-        "ROP",
-        "Target_Demand",
-        "Calculated_Order",
-        "Warehouse_Covered",
-        "Final_Purchase_Order",
-        "Notes",
-    ]
+    # The missing-items worksheet must look exactly like the final order
+    # worksheet.  Start from the final frame's own columns (including the
+    # dynamic sales month headers) and append the buyer-facing reason at the
+    # very end.
+    final_columns = [str(column) for column in final.columns]
+    report_columns = [*final_columns, "سبب عدم الطلب"]
+    sales_columns = {
+        column for column in final_columns if column.startswith("مبيعات ")
+    }
+    # A zero-quantity line in the final sheet is not an ordered item.  It is
+    # kept there to show why it was excluded (covered by a sibling, transferred,
+    # or substituted), so the diagnostic must include it as well.
+    final_quantities = pd.to_numeric(
+        final.get("المطلوب"), errors="coerce"
+    ).fillna(0.0)
     final_codes = {
         str(code).strip()
-        for code in _clean_code_series(final["الكود"]).dropna()
+        for code in _clean_code_series(final.loc[final_quantities > 0, "الكود"])
+        .dropna()
         if str(code).strip()
     }
     driver_codes = _clean_code_series(driver["الكود"])
@@ -3554,6 +4714,28 @@ def _build_missing_items_report(
         .astype(str)
         .str.strip()
         .ne("")
+        | driver.get(
+            "Family_Covered_Out", pd.Series(False, index=driver.index)
+        )
+        .fillna(False)
+        .astype(bool)
+        | driver.get(
+            "Family_Aggregated", pd.Series(False, index=driver.index)
+        )
+        .fillna(False)
+        .astype(bool)
+        | driver.get(
+            "Different_Size_Covered_By", pd.Series("", index=driver.index)
+        )
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .ne("")
+        | driver.get(
+            "Sibling_Transfer_Out", pd.Series(False, index=driver.index)
+        )
+        .fillna(False)
+        .astype(bool)
     )
 
     for _, row in driver.iterrows():
@@ -3583,28 +4765,45 @@ def _build_missing_items_report(
             reason = "Above ROP"
         else:
             reason = "Not Required"
-        rows.append(
-            {
-                "Item_Code": code,
-                "Item_Name": _clean_text(row.get("اسم الصنف"))
-                or _clean_text(row.get("الاسم")),
-                "Source": "catalogue",
-                "Reason": reason,
-                "Branch_Stock": _as_float(row.get("Branch_Stock")),
-                "Warehouse_Stock": _as_float(row.get("Warehouse_Stock")),
-                "Effective_Stock": effective,
-                "ROP": rop,
-                "Target_Demand": target,
-                "Calculated_Order": _as_float(
-                    row.get("Calculated_Order")
-                ),
-                "Warehouse_Covered": _as_float(
-                    row.get("Warehouse_Covered")
-                ),
-                "Final_Purchase_Order": required,
-                "Notes": _clean_text(row.get("ملاحظات")),
-            }
-        )
+        values: dict[str, object] = {
+            "التصنيف": _clean_text(row.get("Export_Category"))
+            or _clean_text(row.get("التصنيف")),
+            "الكود": code,
+            "الاسم": _clean_text(row.get("اسم الصنف"))
+            or _clean_text(row.get("الاسم")),
+            # A missing item is, by definition, excluded from the order.
+            "المطلوب": 0.0,
+            "السعر": _as_float(row.get("Price")),
+            "القيمة المالية للطلب": 0.0,
+            "الموجود في الفرع": _as_float(row.get("Branch_Stock")),
+            "الموجود في المخزن": _as_float(row.get("Warehouse_Stock")),
+            "التحويلات": _as_float(row.get("Net_Transfers")),
+            "المتوسط": _as_float(row.get("Export_Average")),
+            "ROP": _as_float(row.get("ROP")),
+            "Substitutes": _as_float(row.get("Substitutes")),
+            "Lead_Time": _as_float(row.get("Lead_Time")),
+            "تاريخ الوصول المتوقع": _clean_text(
+                row.get("Expected_Arrival")
+            ),
+            "تغطية المخزون (أيام)": _as_float(
+                row.get("Stock_Coverage_Days")
+            ),
+            "سبب الطلب": _clean_text(row.get("Order_Reason")),
+            "ملاحظات": _clean_text(row.get("ملاحظات")),
+            "سبب عدم الطلب": _arabic_missing_reason(row, reason),
+        }
+        for column in final_columns:
+            if column in values:
+                continue
+            if column in sales_columns:
+                values[column] = _as_float(
+                    row.get(column), float("nan")
+                )
+            else:
+                values[column] = row.get(column, "")
+        for column in report_columns:
+            values.setdefault(column, "")
+        rows.append({column: values.get(column, "") for column in report_columns})
 
     # Raw files can contain a code that never reached the catalogue.  Keep it
     # in the diagnostic instead of losing it silently during the merge.
@@ -3624,29 +4823,48 @@ def _build_missing_items_report(
             ):
                 continue
             seen.add(cleaned)
+            raw_values: dict[str, object] = {
+                column: (
+                    float("nan") if column in sales_columns else 0.0
+                )
+                for column in final_columns
+            }
+            raw_values["التصنيف"] = ""
+            raw_values["الكود"] = cleaned
+            raw_values["الاسم"] = ""
+            raw_values["المطلوب"] = 0.0
+            raw_values["السعر"] = 0.0
+            raw_values["القيمة المالية للطلب"] = 0.0
+            raw_values["الموجود في الفرع"] = 0.0
+            raw_values["الموجود في المخزن"] = 0.0
+            raw_values["التحويلات"] = 0.0
+            raw_values["المتوسط"] = 0.0
+            raw_values["ROP"] = 0.0
+            raw_values["Substitutes"] = 0.0
+            raw_values["Lead_Time"] = 0.0
+            raw_values["تاريخ الوصول المتوقع"] = ""
+            raw_values["تغطية المخزون (أيام)"] = 0.0
+            raw_values["سبب الطلب"] = ""
+            raw_values["ملاحظات"] = ""
+            raw_values["سبب عدم الطلب"] = "غير متوفر بالبيانات"
             rows.append(
                 {
-                    "Item_Code": cleaned,
-                    "Item_Name": "",
-                    "Source": role,
-                    "Reason": "Not in master catalogue",
-                    "Branch_Stock": 0.0,
-                    "Warehouse_Stock": 0.0,
-                    "Effective_Stock": 0.0,
-                    "ROP": 0.0,
-                    "Target_Demand": 0.0,
-                    "Calculated_Order": 0.0,
-                    "Warehouse_Covered": 0.0,
-                    "Final_Purchase_Order": 0.0,
-                    "Notes": "",
+                    column: raw_values.get(column, "")
+                    for column in report_columns
                 }
             )
 
     report = pd.DataFrame(rows, columns=report_columns)
     if not report.empty:
-        report = report.sort_values("Item_Code", kind="stable").reset_index(
-            drop=True
-        )
+        sort_columns = [
+            column
+            for column in ("التصنيف", "الكود")
+            if column in report.columns
+        ]
+        if sort_columns:
+            report = report.sort_values(
+                sort_columns, kind="stable"
+            ).reset_index(drop=True)
     return report
 
 

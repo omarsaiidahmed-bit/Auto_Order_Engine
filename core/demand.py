@@ -59,6 +59,7 @@ from core.normalize import normalize_arabic_text, parse_date_series
 
 __all__ = [
     "DemandSpine",
+    "aggregate_family_demand",
     "aggregate_sales_by_sku",
     "build_demand_spine",
     "detect_sales_window_days",
@@ -582,6 +583,101 @@ def _align_optional_to_universe(
     cleaned = cleaned.copy()
     cleaned.index = cleaned.index.astype("string")
     return cleaned.reindex(index)
+
+
+def aggregate_family_demand(
+    family_key: pd.Series,
+    target_demand: pd.Series,
+    *,
+    average: pd.Series | None = None,
+    calculated_order: pd.Series | None = None,
+    branch_stock: pd.Series | None = None,
+    warehouse_stock: pd.Series | None = None,
+) -> pd.DataFrame:
+    """Pool demand and stock for every exact product family.
+
+    The rows are aligned by index, so the result can be assigned directly back
+    onto the catalogue.  ``Family_Target`` is the sum of the per-card
+    ``Target_Demand`` values -- the same target the pipeline already uses
+    (monthly average + ROP + safety stock).  ``Family_Average_Sum`` and
+    ``Family_Calculated_Sum`` are retained for diagnostics and for the buyer's
+    audit trail.
+
+    ``Family_Net_Need`` is the only quantity the aggregation rule consumes:
+    it is ``Family_Target - Family_Stock`` floored at zero.  A family whose
+    stock covers its target therefore produces a zero net need for every
+    sibling, not a separate order on each card.
+    """
+
+    index = target_demand.index
+    if len(index) == 0:
+        return pd.DataFrame(
+            columns=[
+                "Family_Group_Size",
+                "Family_Target",
+                "Family_Average_Sum",
+                "Family_Calculated_Sum",
+                "Family_Branch_Stock",
+                "Family_Warehouse_Stock",
+                "Family_Stock",
+                "Family_Net_Need",
+            ],
+            index=index,
+        )
+
+    def _number(series: pd.Series | None) -> pd.Series:
+        if series is None:
+            return pd.Series(0.0, index=index, dtype="float64")
+        return (
+            pd.to_numeric(series.reindex(index), errors="coerce")
+            .fillna(0.0)
+            .astype("float64")
+        )
+
+    keys = family_key.reindex(index).astype("string").fillna("").str.strip()
+    # An empty identity must never pool unrelated no-name cards together.
+    empty_keys = keys.eq("")
+    if bool(empty_keys.any()):
+        keys = keys.copy()
+        replacement = [
+            f"__row_{position}"
+            for position, is_empty in enumerate(empty_keys.to_numpy())
+            if bool(is_empty)
+        ]
+        keys.loc[empty_keys] = replacement
+
+    frame = pd.DataFrame(
+        {
+            "Family_Key": keys,
+            "Target_Demand": _number(target_demand).clip(lower=0.0),
+            "Average": _number(average),
+            "Calculated_Order": _number(calculated_order).clip(lower=0.0),
+            "Branch_Stock": _number(branch_stock),
+            "Warehouse_Stock": _number(warehouse_stock),
+        },
+        index=index,
+    )
+    grouped = frame.groupby("Family_Key", sort=False)
+    result = pd.DataFrame(index=index)
+    result["Family_Group_Size"] = (
+        grouped["Target_Demand"].transform("size").astype("int64")
+    )
+    result["Family_Target"] = grouped["Target_Demand"].transform("sum")
+    result["Family_Average_Sum"] = grouped["Average"].transform("sum")
+    result["Family_Calculated_Sum"] = grouped[
+        "Calculated_Order"
+    ].transform("sum")
+    result["Family_Branch_Stock"] = grouped["Branch_Stock"].transform("sum")
+    result["Family_Warehouse_Stock"] = grouped[
+        "Warehouse_Stock"
+    ].transform("sum")
+    result["Family_Stock"] = (
+        result["Family_Branch_Stock"] + result["Family_Warehouse_Stock"]
+    )
+    result["Family_Net_Need"] = (
+        result["Family_Target"] - result["Family_Stock"]
+    ).clip(lower=0.0)
+    return result
 
 
 def build_demand_spine(

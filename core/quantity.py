@@ -76,7 +76,10 @@ def to_whole_packs(quantity: float, moq_packs: int = 1) -> int:
         return 0
     value = float(quantity)
     if value <= 0:
-        return -int(math.floor(abs(value)))
+        # Round a negative deficit away from zero without ever flooring the
+        # stock value itself.  Branch and warehouse balances stay fractional;
+        # only an orderable quantity is converted to a whole pack.
+        return -int(math.ceil(abs(value)))
     step = max(1, int(moq_packs))
     return int(math.ceil(value / step) * step)
 
@@ -193,5 +196,8 @@ def integer_export_series(series: pd.Series) -> pd.Series:
     the pack arithmetic.
     """
     values = pd.to_numeric(series, errors="coerce").fillna(0.0).to_numpy(dtype="float64")
-    rounded = np.where(values >= 0, np.ceil(values), np.floor(values))
+    # Always round away from zero.  ``np.floor`` on a negative value would
+    # hide part of the deficit; using the magnitude keeps the decision explicit
+    # and avoids any floor operation on stock-like figures.
+    rounded = np.sign(values) * np.ceil(np.abs(values))
     return pd.Series(rounded.astype("int64"), index=series.index)

@@ -350,11 +350,19 @@ def _coerce_export_frame(
     data: pd.DataFrame,
     diagnostics: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    """Return a frame with exactly the dynamic export columns."""
+    """Return a frame with exactly the dynamic export columns.
+
+    An empty run is a valid business outcome.  In that case the workbook still
+    needs a header-only final sheet instead of raising during export.
+    """
     if not isinstance(data, pd.DataFrame) or data.empty:
         if diagnostics is not None and not diagnostics.empty:
             return _frame_from_diagnostics(diagnostics).reset_index(drop=True)
-        raise ValueError("There are no items to export.")
+        expected = _expected_columns(
+            data if isinstance(data, pd.DataFrame) else None,
+            diagnostics,
+        )
+        return pd.DataFrame(columns=expected)
 
     expected = _expected_columns(data, diagnostics)
     if list(data.columns) == expected:
@@ -376,6 +384,12 @@ def _coerce_export_frame(
 def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
     """Coerce numeric columns, compute money, and drop non-positive lines."""
     frame = frame.copy()
+    if frame.empty:
+        if "التصنيف" in frame.columns:
+            frame["التصنيف"] = frame["التصنيف"].astype("string").fillna(
+                "غير محدد"
+            )
+        return frame
     sales_columns = [column for column in frame.columns if _is_sales_column(str(column))]
     numeric_columns = [
         "المطلوب",
@@ -412,6 +426,8 @@ def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
     # Keep those rows even though their required quantity is zero.
     zero_keep_reasons = {
         "مستبدل بصنف آخر",
+        "تم النقل لكارتة أخرى",
+        "مغطى من نفس الصنف",
         "رصيد كافي في الفرع",
         "رصيد كافي في المخزن",
     }
@@ -424,7 +440,11 @@ def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
         replaced = pd.Series(False, index=frame.index)
     frame = frame.loc[(frame["المطلوب"] > 0) | replaced].copy()
     if frame.empty:
-        raise ValueError("There are no items with a positive required quantity.")
+        if "التصنيف" in frame.columns:
+            frame["التصنيف"] = frame["التصنيف"].astype("string").fillna(
+                "غير محدد"
+            )
+        return frame
 
     # System figures: a missing value means "not available", but the column
     # is still numeric, so zero is the honest empty value.
@@ -465,7 +485,14 @@ def _normalise_numbers(frame: pd.DataFrame) -> pd.DataFrame:
         for code, is_integer, raw in zip(codes, integral, frame["الكود"])
     ]
 
-    frame["التصنيف"] = frame["التصنيف"].fillna("").astype("string")
+    frame["التصنيف"] = (
+        frame["التصنيف"]
+        .astype("string")
+        .str.strip()
+        .replace("", pd.NA)
+        .fillna("غير محدد")
+        .astype("string")
+    )
     frame["الاسم"] = frame["الاسم"].fillna("").astype("string")
     return frame.reset_index(drop=True)
 
@@ -791,6 +818,143 @@ def _write_sheet(
     return len(frame)
 
 
+_MISSING_REASON_COLUMN = "سبب عدم الطلب"
+_MISSING_ITEMS_COLUMNS = [_MISSING_REASON_COLUMN]
+
+
+def _write_missing_sheet(
+    writer: pd.ExcelWriter,
+    missing_items: pd.DataFrame | None,
+    *,
+    columns: Iterable[str] | None = None,
+) -> None:
+    """Write the missing-items sheet with the final order's exact contract.
+
+    The sheet uses the same headers, order and RTL layout as
+    ``الطلبية النهائية``.  The only extra column is the Arabic
+    ``سبب عدم الطلب`` at the end.
+    """
+    if isinstance(missing_items, pd.DataFrame):
+        frame = missing_items.copy().reset_index(drop=True)
+    else:
+        frame = pd.DataFrame()
+
+    expected = [
+        str(column)
+        for column in (columns if columns is not None else [])
+        if str(column) != _MISSING_REASON_COLUMN
+    ]
+    if not expected:
+        expected = [
+            str(column)
+            for column in frame.columns
+            if str(column) != _MISSING_REASON_COLUMN
+        ]
+    contract = [*expected, _MISSING_REASON_COLUMN]
+
+    # Older/custom callers can still supply an English ``Reason`` column.
+    if _MISSING_REASON_COLUMN not in frame.columns:
+        english_reasons = (
+            frame["Reason"].fillna("").astype(str)
+            if "Reason" in frame.columns
+            else pd.Series("", index=frame.index, dtype="object")
+        )
+        frame[_MISSING_REASON_COLUMN] = english_reasons.map(
+            {
+                "Zero Sales": "صنف راكد (لا يوجد مبيعات)",
+                "Stagnant / No Sales": "صنف راكد (لا يوجد مبيعات)",
+                "Sufficient Stock": "رصيد الفرع كافي",
+                "Above ROP": "أعلى من نقطة إعادة الطلب",
+                "Filtered by scope": "مستبعد من نطاق الطلب",
+                "Not in master catalogue": "غير متوفر بالبيانات",
+                "No data": "غير متوفر بالبيانات",
+            }
+        ).fillna("غير مطلوب")
+
+    for column in contract:
+        if column not in frame.columns:
+            frame[column] = ""
+    frame = frame.loc[:, contract]
+
+    worksheet = writer.book.add_worksheet("Missing_Items")
+    worksheet.right_to_left()
+    worksheet.freeze_panes(1, 0)
+    worksheet.set_default_row(18)
+
+    header_format = writer.book.add_format(
+        {
+            "bg_color": EXPORT_HEADER_BACKGROUND,
+            "font_color": "#FFFFFF",
+            "bold": True,
+            "align": "center",
+            "valign": "vcenter",
+            "border": 0,
+        }
+    )
+    text_format = writer.book.add_format(
+        {"valign": "vcenter", "text_wrap": False}
+    )
+    integer_format = writer.book.add_format(
+        {"valign": "vcenter", "num_format": "#,##0"}
+    )
+    float_format = writer.book.add_format(
+        {"valign": "vcenter", "num_format": "#,##0.00"}
+    )
+
+    columns = [str(column) for column in frame.columns]
+    display_headers = [
+        _ARABIC_HEADERS.get(column, column) for column in columns
+    ]
+    for position, column in enumerate(columns):
+        sample = frame[frame.columns[position]] if not frame.empty else []
+        lengths = [
+            len(str(value))
+            for value in sample
+            if not _is_missing(value)
+        ]
+        longest = max(lengths) if lengths else 0
+        width = min(
+            max(12, len(display_headers[position]) + 2, longest + 2), 60
+        )
+        worksheet.set_column(position, position, width, text_format)
+
+    worksheet.write_row(0, 0, display_headers, header_format)
+    for row_number, row in enumerate(
+        frame.itertuples(index=False, name=None), start=1
+    ):
+        for column_number, value in enumerate(row):
+            if _is_missing(value):
+                worksheet.write_blank(
+                    row_number, column_number, None, text_format
+                )
+                continue
+            if isinstance(value, bool):
+                worksheet.write_string(
+                    row_number, column_number, str(value), text_format
+                )
+            elif isinstance(value, (int, float)):
+                number = float(value)
+                if number.is_integer():
+                    worksheet.write_number(
+                        row_number,
+                        column_number,
+                        int(number),
+                        integer_format,
+                    )
+                else:
+                    worksheet.write_number(
+                        row_number,
+                        column_number,
+                        number,
+                        float_format,
+                    )
+            else:
+                worksheet.write_string(
+                    row_number, column_number, str(value), text_format
+                )
+    worksheet.autofilter(0, 0, len(frame), max(len(columns) - 1, 0))
+
+
 def _write_audit_sheet(
     writer: pd.ExcelWriter,
     data: pd.DataFrame,
@@ -827,6 +991,7 @@ def export_styled_excel(
     data: pd.DataFrame,
     *,
     diagnostics: pd.DataFrame | None = None,
+    missing_items: pd.DataFrame | None = None,
     include_audit_columns: bool = False,
     progress_callback: ProgressCallback | None = None,
     pushing_codes: Iterable[object] | None = None,
@@ -854,6 +1019,13 @@ def export_styled_excel(
     if progress_callback is not None:
         progress_callback("🧾 Preparing the final order sheet...")
 
+    # PipelineResult keeps the diagnostic report separately; accept it both
+    # directly and from diagnostics attrs for older callers.
+    if missing_items is None and diagnostics is not None:
+        candidate = diagnostics.attrs.get("missing_items")
+        if isinstance(candidate, pd.DataFrame):
+            missing_items = candidate
+
     export_data = _coerce_export_frame(data, diagnostics)
     export_data = _normalise_numbers(export_data)
     colours = _row_colours(
@@ -880,7 +1052,7 @@ def export_styled_excel(
     ) as writer:
         workbook = writer.book
         worksheet = workbook.add_worksheet("الطلبية النهائية")
-        written_rows = _write_sheet(
+        _write_sheet(
             worksheet,
             workbook,
             export_data,
@@ -888,8 +1060,13 @@ def export_styled_excel(
             sheet_name="الطلبية النهائية",
             progress_callback=progress_callback,
         )
-        if written_rows == 0:
-            raise ValueError("The generated workbook has no order rows.")
+        # The diagnostics sheet is always present, even when the report is
+        # empty, so the workbook contract is exactly two sheets.
+        if progress_callback is not None:
+            progress_callback("🧾 Writing the missing-items diagnostics sheet...")
+        _write_missing_sheet(
+            writer, missing_items, columns=export_data.columns
+        )
         if include_audit_columns:
             _write_audit_sheet(writer, export_data, diagnostics)
 

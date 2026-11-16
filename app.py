@@ -2289,6 +2289,7 @@ def render_order_page() -> None:
             excel_bytes = export_styled_excel(
                 final_df,
                 diagnostics=st.session_state.get("result_diagnostics"),
+                missing_items=st.session_state.get("result_missing"),
             ).getvalue()
         except Exception as error:  # noqa: BLE001
             st.warning(tr("excel_error", error=error))
